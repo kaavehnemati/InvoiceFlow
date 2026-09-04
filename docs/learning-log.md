@@ -1115,3 +1115,149 @@ means every future caller inherits a judgement that was made for someone else's 
 4. Why does `create()` take an ORM object rather than the request schema?
 5. How would you prove a refactor changed no behavior when IDs come from a database sequence?
 6. What breaks if a repository commits, and you later need two writes to be atomic?
+
+---
+
+## Phase 9 — Service Layer
+
+### What I learned
+
+**Three layers, three jobs:**
+
+```text
+Router       transport      what a 422 is, what a request body looks like
+Service      behavior       what a valid invoice is, what a duplicate means
+Repository   persistence    how rows get in and out of a table
+```
+
+The router shrank from 117 lines to 43, and every line left in it is about HTTP.
+
+**The duplicate rule is why the rules had to move.** The other six rules can be answered by
+looking at the invoice alone. This one cannot:
+
+```python
+if self.repository.find_by_vendor_and_invoice_number(data.vendor, data.invoice_number):
+```
+
+It needs to know what is already stored. A rule that needs the database cannot live in the
+router, because the router is not supposed to have one. That is the concrete pressure that
+made this phase necessary rather than decorative.
+
+**The service imports no FastAPI.** Verified rather than assumed — importing
+`app.services.invoice_service` loads zero `fastapi` modules, and its only top-level imports
+are `datetime` and `app`. That is what makes the Definition of Done achievable: **10 rule
+checks ran with no uvicorn, no client, no HTTP.**
+
+**The cost of that independence is a tuple.** `create()` returns `(invoice, issues)`:
+
+```python
+created, issues = service.create(invoice)
+if issues:
+    raise HTTPException(status_code=422, detail=issues)
+return created
+```
+
+It cannot raise `HTTPException` without depending on the web framework, and domain exceptions
+are Phase 12. So the awkwardness is deliberate and temporary — it is exactly the discomfort
+Phase 12 exists to relieve.
+
+**Verifying a phase that is not a pure refactor.** Phases 5 and 8 demanded an empty diff.
+This one changes behavior, so the standard becomes: *predict the diff, then confirm it is
+exactly that*. Predicted two changed entries — the deliberate duplicate going `201 -> 422`,
+and the list dropping from 6 invoices to 5. Both appeared, nothing else did.
+
+The subtle thing that had to be checked: the rule-failure cases run *before* any invoice is
+stored, so they must not pick up a spurious `DUPLICATE_INVOICE`. They didn't.
+
+### A race I found, and the honest version of the story
+
+`create()` checks for a duplicate and then inserts, with no constraint underneath. I fired 12
+concurrent identical requests expecting duplicates to slip through:
+
+```text
+12 concurrent POSTs -> 1 x 201, 11 x 422       one row stored
+```
+
+It did not reproduce. That is not the same as being safe, so I forced the interleaving
+directly:
+
+```text
+session A: find_by_vendor_and_invoice_number -> None
+session B: find_by_vendor_and_invoice_number -> None
+session A: INSERT -> id 1
+session B: INSERT -> id 2      two rows, same vendor + invoice_number
+```
+
+Two rows. The race is real; the window is just narrow enough that ordinary load does not hit
+it. **A test that passes under concurrency is not proof of correctness — it can be proof of
+timing.**
+
+The real fix is a unique constraint, making the database the arbiter instead of a prior
+`SELECT`. That needs a migration plus `IntegrityError` handling, which wants Phase 12's
+machinery. Recorded in the README rather than patched here.
+
+### Why this phase was needed
+
+70 of the router's 117 lines were business rules. Changing what makes an invoice valid meant
+editing the HTTP layer, and the duplicate rule could not be written at all, because it needed
+a database the router had no business touching.
+
+### What problem existed before it
+
+Business rules lived inside a FastAPI route function. They could not be called without an
+HTTP request, could not query anything, and could not be reused by the Excel importer or
+document extractor that later phases require.
+
+### New concepts
+
+- Service layer as the home for business behavior
+- Returning results instead of raising, to avoid framework coupling
+- Rules that require state, and why they force a layer boundary
+- Predicting a behavior diff instead of demanding an empty one
+- Check-then-insert races, and why load testing does not prove their absence
+
+### Things I still do not fully understand
+
+- `create()` calls `validate()`, which queries the database, then inserts. Should the whole
+  operation be one transaction with the row locked, or is the unique constraint the only real
+  answer?
+- Reads bypass the service entirely. When Phase 39 adds `?status=NEEDS_REVIEW`, does filtering
+  become business behavior, or is it still just a query?
+- `validate()` is public so it can be tested. Is exposing it a design decision or a testing
+  convenience leaking into the API?
+
+### One architecture decision I can now explain
+
+**Why the service must not know FastAPI exists.**
+
+Raising `HTTPException(422, ...)` from inside `InvoiceService` would be shorter and read more
+naturally than returning a tuple the caller has to unpack. The reason not to is that it would
+make "this invoice is invalid" and "the HTTP response should be 422" the same statement, when
+they are two different claims made by two different layers.
+
+The costs land in phases that are already on the roadmap. Phase 20's Excel importer validates
+a thousand rows and produces a report — there is no response to set a status code on, and one
+bad row must not abort the other 999. Phase 38 extracts invoices from PDFs, where a failure
+routes the invoice to human review rather than to a client. Phase 14 wants to assert that a
+future-dated invoice is rejected without starting a web server. A service that raises
+`HTTPException` serves none of them, and the usual workaround — catching the framework's
+exception outside the framework — is worse than the tuple.
+
+There is a testing argument too, and the Definition of Done makes it the point of the phase:
+*business rules can be tested without making HTTP requests*. Ten rules were checked by calling
+a Python method. No server, no port, no client, no serialization. When those tests fail they
+fail on the rule, not on transport.
+
+The general shape: **a layer should depend on what it needs, not on what called it.** The
+service needs a repository and a clock. It does not need to know that something upstream
+speaks HTTP — and the moment it does, everything that is not HTTP is locked out.
+
+### Interview questions I should be able to answer
+
+1. What belongs in a router, a service, and a repository?
+2. Why shouldn't a service raise `HTTPException`?
+3. What is the cost of that rule, and how does it get paid back later?
+4. Which business rule forced the service layer to exist, and why couldn't it live in the router?
+5. Why is a duplicate check that passes 12 concurrent requests still not safe?
+6. How do you verify a phase that deliberately changes behavior?
+7. Why is `409` a better status for a duplicate than `422`?

@@ -36,6 +36,18 @@ class InvoiceRepository:
     def get_by_id(self, invoice_id: int) -> Invoice | None:
         return self.session.get(Invoice, invoice_id)
 
+    def find_by_vendor_and_invoice_number(
+        self, vendor: str, invoice_number: str
+    ) -> Invoice | None:
+        # Answers "does this row exist", not "is this allowed". The caller
+        # decides what an existing row means.
+        return self.session.scalars(
+            select(Invoice).where(
+                Invoice.vendor == vendor,
+                Invoice.invoice_number == invoice_number,
+            )
+        ).first()
+
     def list_all(self) -> list[Invoice]:
         # Named list_all rather than list: a method called `list` shadows the
         # builtin for every later annotation in this class body, so a
