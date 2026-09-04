@@ -439,3 +439,140 @@ database row carries columns that are not part of the API.
 6. Why did adding `response_model` change the JSON type of the money fields?
 7. Why does sending `1000.00` as a JSON number lose precision when sending `"1000.00"` does
    not?
+
+---
+
+## Phase 4 — Basic Business Validation
+
+### What I learned
+
+**Structural validation and business validation answer different questions.**
+
+```text
+InvoiceCreate asks:  is this shaped like an invoice?
+validate_invoice asks: does this invoice make sense?
+```
+
+The gap between them is the whole phase. This payload passed the schema and was stored as a
+real invoice at the end of Phase 3:
+
+```json
+{"subtotal":"1000","tax":"190","total":"9999",
+ "currency":"XYZ","invoice_date":"2099-12-31"}
+```
+
+Every field is the correct type. The arithmetic is wrong, `XYZ` is not a currency, and the
+invoice is dated 73 years from now. It now returns `422` with three issues.
+
+**Why syntactically valid data can still be invalid for the business.** A type system can
+check that `total` is a decimal. It cannot check that `total` is *the right* decimal, because
+that depends on the other fields — and on rules a company chose, which no type expresses.
+`subtotal + tax == total` is arithmetic; `currency in {EUR, USD, GBP}` is a policy someone
+decided and could change tomorrow.
+
+**Reporting every failure at once.** The rules run to completion and collect issues rather
+than returning at the first problem. Verified:
+
+```text
+POST subtotal:-5 tax:-5 total:9999 currency:XYZ date:2099-12-31
+→ 422 with 5 issues: NEGATIVE_AMOUNT×2, TOTAL_MISMATCH,
+                     FUTURE_INVOICE_DATE, INVALID_CURRENCY
+```
+
+One round trip tells a client everything to fix. Stopping at the first failure would mean
+five submissions to discover five problems, which becomes intolerable in Phase 20 when a
+thousand-row spreadsheet is being validated.
+
+**`Decimal` finally proved itself.** This invoice is accepted:
+
+```text
+subtotal 0.10  +  tax 0.20  ==  total 0.30      -> 201 VALID
+```
+
+The same comparison in binary float, verified in the same run:
+
+```text
+0.1 + 0.2 == 0.3   ->   False
+0.1 + 0.2          ->   0.30000000000000004
+```
+
+Had the model used `float`, `TOTAL_MISMATCH` would fire on an invoice that is arithmetically
+correct — and it would do so unpredictably, depending on which amounts happened to be
+unrepresentable. Choosing `Decimal` in Phase 2 was a bet that paid off in Phase 4.
+
+**Two 422 shapes now exist.** Schema failures carry `{type, loc, msg, input}`; business
+failures carry `{code, field, message}`. Same status code, different bodies, because they
+come from different layers.
+
+### Why this phase was needed
+
+Everything above the API — a database schema, an import pipeline, an accounting export —
+would inherit the assumption that a stored invoice is a *real* invoice. Phase 3 guaranteed
+only that it had invoice-shaped fields. The cheapest place to stop nonsense is the moment it
+arrives, before anything downstream has acted on it.
+
+It also unblocked `status`. It had been pinned to `DRAFT` since Phase 3 because nothing had
+the authority to promote it. Now something does.
+
+### What problem existed before it
+
+Invoices whose totals contradicted themselves, whose currency did not exist, and whose dates
+were in the future were accepted with `201` and stored. `status` was a field that never
+changed.
+
+### New concepts
+
+- Business rules as code separate from the type system
+- Accumulating errors rather than failing fast
+- Machine-readable issue codes (`TOTAL_MISMATCH`, `NEGATIVE_AMOUNT`, …)
+- Validation functions that return data instead of raising
+- Rule boundaries: `<=` vs `<`, `>=` vs `>` — today's date is valid, zero is a valid amount
+- Decimal arithmetic as a correctness requirement, not a style preference
+
+### Things I still do not fully understand
+
+- Is `422` right for a business-rule failure, or is `400` more accurate? Both are defensible;
+  the playbook picks 422 in Phase 12, but I could not defend that choice from first
+  principles yet.
+- Should the two 422 shapes be unified? A client currently has to branch on which keys exist.
+- `TOTAL_MISMATCH` fires alongside `NEGATIVE_AMOUNT` when an amount is negative, since a
+  negative total also breaks the sum. Is that noise, or useful completeness?
+- Where should `SUPPORTED_CURRENCIES` live once it becomes configurable per customer — Phase
+  11's settings, or the database?
+
+### One architecture decision I can now explain
+
+**Why `validate_invoice` returns a list instead of raising an HTTP error.**
+
+Raising `HTTPException` directly from inside the rules would be shorter — no return value to
+inspect, no `if issues:` in the caller. It would also quietly weld the business rules to the
+web framework, and the cost lands in three later phases at once.
+
+Phase 20 has to run these exact rules over rows from a spreadsheet. There is no request to
+fail there: a thousand-row import needs *every* invoice's issues collected into a report, and
+one bad row must not abort the other 999. A function that raises can only reject one thing
+and only in an HTTP context. A function that returns a list can be called in a loop.
+
+Phase 38 has the same requirement for invoices extracted from PDFs by OCR, where a failure
+should route the invoice to human review rather than return a status code to nobody.
+
+And Phase 9 moves these rules into a service layer whose stated rule is that it must not
+depend on FastAPI — precisely so it can be tested without HTTP and reused without a request.
+By returning data now, that move is a cut-and-paste rather than a rewrite.
+
+The general shape: **a function that computes an answer is reusable; a function that performs
+a side effect is reusable only in the context that side effect belongs to.** The route
+handler is the right place to decide that a list of issues means `422`, because the route is
+the only part of this system that knows what HTTP is.
+
+### Interview questions I should be able to answer
+
+1. What is the difference between schema validation and business validation? Give an example
+   that passes one and fails the other.
+2. Why report every validation failure instead of returning at the first?
+3. Why does `validate_invoice` return a list rather than raise an exception?
+4. Show a concrete invoice where `float` would produce the wrong validation result and
+   `Decimal` produces the right one.
+5. Why is `currency in {EUR, USD, GBP}` a business rule rather than part of the schema?
+6. Why is an invoice dated today accepted but one dated tomorrow rejected?
+7. When would you store an invalid record instead of rejecting it outright?
