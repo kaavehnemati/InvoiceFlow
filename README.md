@@ -2,9 +2,10 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 8 — repository layer. Persistence has moved out of the routes into
-`InvoiceRepository`, so no route contains SQL any more. Business rules still live in the
-router, and there is no service layer yet. Each is introduced by a later
+**Current status:** Phase 9 — service layer. The three layers are in place: routes handle
+HTTP, `InvoiceService` owns the business rules, `InvoiceRepository` owns persistence. Routes
+still wire their own collaborators by hand, and errors are still raised as
+`HTTPException` from the router. Each is addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -184,6 +185,11 @@ makes *sense*. An invoice that breaks any of them is refused with `422` and is n
 | `subtotal + tax == total` | `TOTAL_MISMATCH` |
 | `invoice_date <= today` (UTC) | `FUTURE_INVOICE_DATE` |
 | `currency in {EUR, USD, GBP}` | `INVALID_CURRENCY` |
+| `vendor + invoice_number` must not already exist | `DUPLICATE_INVOICE` |
+
+`DUPLICATE_INVOICE` currently returns `422` alongside the other rules. Phase 12 gives it its
+own `DuplicateInvoiceError` and promotes it to `409 Conflict`, which is the more accurate code
+for "this conflicts with something that already exists."
 
 All rules are evaluated on every request, so one response reports everything that is wrong:
 
@@ -303,7 +309,7 @@ playbook introduces each fix only once the problem is visible.
 
 | Limitation | Try it | Resolved by |
 | --- | --- | --- |
-| The same invoice can be submitted any number of times | `POST` an identical invoice twice → two `201`s, two IDs | Phase 9 — duplicate detection on `vendor + invoice_number` |
+| Duplicate detection is check-then-insert with no constraint underneath, so two *concurrent* requests can both pass the check and both write | see below | Phase 33 — idempotency |
 | Amounts with more than 2 decimal places are **silently rounded** by the database, which can break an invoice that passed validation | `POST` `subtotal:"0.005", tax:"0.005", total:"0.010"` → `201`, stored as `0.01 + 0.01 = 0.01` | unowned — see below |
 | A database error surfaces as a bare `500` | `POST` an amount above `9999999999.99` → `500 Internal Server Error` | Phase 12 — exception handling |
 | Nothing ever modifies an invoice, so `updated_at` always equals `created_at` | — | Phase 39 — review workflow |
@@ -313,6 +319,27 @@ One thing worth knowing about the current validation: **unknown fields are ignor
 rejected.** `{"...": ..., "nonsense": true}` succeeds and `nonsense` is simply dropped. This
 is Pydantic's default; a typo like `vendour` therefore surfaces as *"vendor: Field
 required"* rather than as a complaint about `vendour`.
+
+### The duplicate race, in detail
+
+`InvoiceService.create()` checks for a duplicate and then inserts. Nothing in the database
+enforces uniqueness, so the check can go stale between those two steps:
+
+```text
+session A: find_by_vendor_and_invoice_number -> None
+session B: find_by_vendor_and_invoice_number -> None
+session A: INSERT  -> id 1
+session B: INSERT  -> id 2      two rows, same vendor + invoice_number
+```
+
+That interleaving was reproduced deliberately and does produce two rows. The window is narrow
+— `create()` re-runs the check immediately before writing — and 12 concurrent identical `POST`
+requests produced 1 × `201` and 11 × `422`, so it does not show up under ordinary load. It is
+still a correctness gap, not a performance one.
+
+The real fix is a unique constraint on `(vendor, invoice_number)`, which makes the database
+the arbiter rather than a prior `SELECT`. That means a migration plus catching `IntegrityError`
+and turning it into the same issue — which wants Phase 12's exception handling to do cleanly.
 
 ### The rounding gap, in detail
 
@@ -345,9 +372,11 @@ recorded here rather than fixed silently.
 │   ├── repositories/
 │   │   └── invoice_repository.py   # All invoice SQL lives here
 │   ├── routers/
-│   │   └── invoices.py      # Invoice routes and business rules
-│   └── schemas/
-│       └── invoice.py       # InvoiceCreate, InvoiceRead
+│   │   └── invoices.py      # HTTP only: routes, status codes
+│   ├── schemas/
+│   │   └── invoice.py       # InvoiceCreate, InvoiceRead
+│   └── services/
+│       └── invoice_service.py      # Business rules and invoice creation
 ├── migrations/
 │   ├── env.py               # Alembic config; reads DATABASE_URL
 │   └── versions/            # One file per schema change
@@ -368,20 +397,26 @@ unrelated things at once — the app object, both schemas, the store, the busine
 every route. It was not done because layered folders are inherently better. A project this
 size does not need them until reading it becomes annoying, and that is the signal to act on.
 
-Phase 8 moved persistence out. `InvoiceRepository` owns every SQLAlchemy call, and the
-routes now read as: validate, then ask the repository. The split follows one rule the
-repository is not allowed to break —
+Each layer has one job, and the boundaries are rules rather than conventions:
+
+```text
+Router       ->  InvoiceService   ->  InvoiceRepository  ->  PostgreSQL
+transport        business behavior    persistence
+```
 
 > **The repository handles persistence only.** It does not decide whether totals are valid,
 > whether a currency is supported, or whether an invoice should be accepted. Handed a
 > nonsense invoice, it stores the nonsense faithfully.
 
-That is deliberate, not an oversight. It is what lets the Excel importer (Phase 20) and the
-document extractor (Phase 38) save invoices through the same class without inheriting the
-HTTP layer's idea of what is valid.
+> **The service knows nothing about HTTP.** `app/services/invoice_service.py` imports only
+> `datetime` and other `app` modules — importing it loads no FastAPI module at all. That is
+> what lets the business rules be exercised without a running server, and what will let the
+> Excel importer (Phase 20) and the document extractor (Phase 38) apply the same rules to
+> invoices that never arrived over HTTP.
 
-Note what is *still* not separated. `validate_invoice()` remains in the router, so business
-rules and HTTP concerns share a file, and the routes still open sessions and construct the
-repository by hand. Phase 9 moves the rules into a service; Phase 10 replaces the manual
-wiring with injected dependencies. Doing either now would leave those phases with nothing to
-demonstrate.
+The price of that independence is visible in `InvoiceService.create()`, which returns
+`(invoice, issues)` rather than raising: it cannot raise `HTTPException` without depending on
+the web framework. Phase 12 introduces domain exceptions and takes the tuple away.
+
+Note what is *still* not separated: routes open sessions and construct the service and
+repository by hand. Phase 10 replaces that with injected dependencies.
