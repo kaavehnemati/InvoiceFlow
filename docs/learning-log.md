@@ -985,3 +985,133 @@ migrate is the one that silently does nothing.
 5. Why is `create_all()` not a substitute for migrations?
 6. What happens when two developers each add a migration on the same parent revision?
 7. Where should the database connection string live, and why not in `alembic.ini`?
+
+---
+
+## Phase 8 — Repository Layer
+
+### What I learned
+
+**Router = HTTP. Repository = persistence.** Two sentences, and the whole phase follows from
+them. A route's job is to translate between HTTP and the application: read a body, pick a
+status code, raise a 404. A repository's job is to put objects in a database and get them
+back. Neither should be able to describe the other's work.
+
+Before, one function did both:
+
+```python
+with SessionLocal() as session:
+    session.add(db_invoice)
+    session.commit()
+    session.refresh(db_invoice)
+    return db_invoice
+```
+
+After:
+
+```python
+with SessionLocal() as session:
+    return InvoiceRepository(session).create(db_invoice)
+```
+
+**The session is injected, not created.** `InvoiceRepository(session)` takes the session
+through `__init__`. A repository that opened its own session could never share a transaction
+with anything else — and Phase 22 needs an invoice and all its items to commit or fail
+together.
+
+**`create()` takes an `Invoice`, not an `InvoiceCreate`.** The repository must not depend on
+the API's request schema. Phase 20's Excel importer will save invoices that never came from
+an HTTP body, and it will call this same method.
+
+**A method named `list` is a trap.** Defining `def list(self)` inside a class body shadows the
+builtin for every *later* annotation in that body, so a subsequent `-> list[Invoice]` raises
+`TypeError`. Named it `list_all`.
+
+**Verifying a refactor, again.** Same method as Phase 5: capture the API surface before,
+replay after, diff.
+
+```text
+79 request/response pairs   ->  diff empty
+openapi.json                ->  byte-identical
+```
+
+One new wrinkle: IDs now come from a database sequence, so both runs had to start from a
+truncated table to be comparable. In Phase 5 the in-memory list reset itself on restart; a
+database does not forget.
+
+**Checking the Definition of Done mechanically.** "Routers no longer contain SQLAlchemy query
+logic" is greppable, so it was checked by grep rather than by reading:
+
+```bash
+grep -nE 'session\.(add|commit|refresh|get|query|scalars|execute)|select\(' \
+     app/routers/invoices.py     # no matches
+```
+
+### Why this phase was needed
+
+Three routes had session handling copy-pasted between them, and each one had three unrelated
+reasons to change: an HTTP contract change, a business-rule change, or a persistence change.
+The Phase 6 log predicted this pressure would build by Phase 8, and it did — exactly three
+copies.
+
+### What problem existed before it
+
+Routes knew about `Session`, `add`, `commit`, `refresh`, `select` and `get`. Changing how
+invoices were stored meant editing every route that stored one.
+
+### New concepts
+
+- Repository as a persistence boundary
+- Constructor-injected sessions, and why the repository must not own one
+- Repositories accepting domain objects rather than request schemas
+- Greppable definitions of done
+- Baseline resets when identity is database-assigned
+
+### Things I still do not fully understand
+
+- `create()` commits. That works for one entity — what does it become in Phase 22 when an
+  invoice and its items must be atomic? Presumably the commit moves out, but to where?
+- Should `get_by_id` returning `None` be the repository's answer, or should it raise? Right
+  now the router turns `None` into a 404, which feels right, but Phase 12 adds
+  `InvoiceNotFoundError` and I am not sure which layer will raise it.
+- Is `list_all()` viable once there are 100,000 invoices? Nothing paginates.
+
+### One architecture decision I can now explain
+
+**Why the repository is forbidden from knowing what a valid invoice is.**
+
+The playbook states the rule flatly: the repository must not decide whether totals are valid,
+whether a currency is supported, or whether an invoice should be accepted. Enforcing it
+produces a class that will cheerfully store garbage — demonstrated rather than assumed:
+
+```text
+repository.create(invoice with currency XYZ, dated 2099,
+                  subtotal -5, tax -5, total 9999)
+  -> stored, id=7
+
+POST the same invoice to the API
+  -> 422 with 5 issues
+```
+
+Two different answers to the same data, and both are correct. The API is a policy boundary;
+the repository is a storage boundary.
+
+The temptation is to add the check "just in case" — defence in depth, a guard against a future
+caller who forgets. What that actually buys is a second copy of the rules, which will drift
+from the first, and a repository that cannot be reused. Phase 20's Excel importer must be able
+to store an invoice it has *already* validated, and Phase 39's review workflow must be able to
+store one it has explicitly decided is `NEEDS_REVIEW` — an invoice known to be wrong, kept
+deliberately so a human can fix it. A repository that refuses invalid data cannot serve either.
+
+The deeper principle: **validation is a decision, storage is a mechanism.** Decisions vary by
+context and change with the business; mechanisms do not. Putting a decision inside a mechanism
+means every future caller inherits a judgement that was made for someone else's use case.
+
+### Interview questions I should be able to answer
+
+1. What belongs in a router, and what belongs in a repository?
+2. Why does the repository receive a session instead of creating one?
+3. Why shouldn't a repository validate the data it stores?
+4. Why does `create()` take an ORM object rather than the request schema?
+5. How would you prove a refactor changed no behavior when IDs come from a database sequence?
+6. What breaks if a repository commits, and you later need two writes to be atomic?

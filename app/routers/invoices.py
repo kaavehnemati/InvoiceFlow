@@ -1,10 +1,10 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
-from sqlalchemy import select
 
 from app.db.session import SessionLocal
 from app.models.invoice import Invoice
+from app.repositories.invoice_repository import InvoiceRepository
 from app.schemas.invoice import InvoiceCreate, InvoiceRead
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
@@ -81,9 +81,8 @@ def validate_invoice(invoice: InvoiceCreate) -> list[dict]:
 # an empty path produces exactly /invoices, while "/" would produce /invoices/
 # and make the old URL a redirect.
 #
-# These routes open a database session directly. That is what the playbook asks
-# for at this phase; Phase 8 moves the queries into a repository and Phase 10
-# replaces SessionLocal() with an injected dependency.
+# These routes still open the session and construct the repository by hand.
+# Phase 10 replaces both with injected dependencies.
 @router.post("", response_model=InvoiceRead, status_code=201)
 def create_invoice(invoice: InvoiceCreate):
     issues = validate_invoice(invoice)
@@ -100,27 +99,19 @@ def create_invoice(invoice: InvoiceCreate):
             # was created. The model's onupdate takes over from here.
             updated_at=now,
         )
-        session.add(db_invoice)
-        session.commit()
-        # commit() expires the instance, so its attributes are unloaded. The id
-        # was assigned by the database and has never been in Python at all.
-        # refresh() re-reads the row to bring both back.
-        session.refresh(db_invoice)
-        return db_invoice
+        return InvoiceRepository(session).create(db_invoice)
 
 
 @router.get("", response_model=list[InvoiceRead])
 def list_invoices():
     with SessionLocal() as session:
-        # A table has no inherent row order. The in-memory list happened to
-        # return insertion order, so ordering by id preserves that behavior.
-        return session.scalars(select(Invoice).order_by(Invoice.id)).all()
+        return InvoiceRepository(session).list_all()
 
 
 @router.get("/{invoice_id}", response_model=InvoiceRead)
 def get_invoice(invoice_id: int):
     with SessionLocal() as session:
-        invoice = session.get(Invoice, invoice_id)
+        invoice = InvoiceRepository(session).get_by_id(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found")
         return invoice
