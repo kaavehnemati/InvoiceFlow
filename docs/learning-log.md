@@ -576,3 +576,120 @@ the only part of this system that knows what HTTP is.
 5. Why is `currency in {EUR, USD, GBP}` a business rule rather than part of the schema?
 6. Why is an invoice dated today accepted but one dated tomorrow rejected?
 7. When would you store an invalid record instead of rejecting it outright?
+
+---
+
+## Phase 5 — Routers and Package Structure
+
+### What I learned
+
+**`APIRouter` is a FastAPI app's routing table without the app.** It collects routes in one
+module, and `app.include_router(router)` mounts them onto the real application. The routes
+themselves are written exactly as before — same decorators, same `response_model`, same
+`status_code`.
+
+```python
+# app/routers/invoices.py
+router = APIRouter(prefix="/invoices", tags=["invoices"])
+
+# app/main.py
+app.include_router(invoices.router)
+```
+
+**`prefix` and `tags` are what a router buys you.** The prefix is written once instead of on
+every decorator; the tags group the routes under a heading in `/docs`.
+
+**An empty path is not the same as `"/"`.** Under a `/invoices` prefix:
+
+```text
+@router.get("")   ->  /invoices     correct
+@router.get("/")  ->  /invoices/    a different URL
+```
+
+Getting that wrong would have made the old URL a redirect. Verified afterwards:
+`/invoices` returns 200 directly, and `/invoices/` returns 307 to it — the same as before.
+
+**Python packages.** A directory with an `__init__.py` is a regular package, and
+`from app.schemas.invoice import InvoiceCreate` walks that tree. Since Python 3.3 the
+`__init__.py` is optional (the directory would become a namespace package), but writing it
+is the convention and avoids surprises as the tree grows.
+
+**The entrypoint moved:** `uvicorn main:app` became `uvicorn app.main:app`.
+
+**How to verify a refactor.** A refactor claims a *difference is absent*, which is not
+something a few spot-check requests can establish. What worked: capture the whole API surface
+before touching anything, replay the identical battery afterwards, and diff.
+
+```text
+79 lines of recorded status + body     ->  diff empty
+openapi.json                           ->  only the 3 "tags" additions
+```
+
+That diff caught something I would otherwise have shipped: rewording a docstring while moving
+it changed the published OpenAPI `description`, because FastAPI exposes model docstrings in
+the schema. Harmless, but it is a contract change, and this phase was supposed to change
+nothing. Reverting the wording made the diff clean.
+
+### Why this phase was needed
+
+`main.py` had reached 159 lines holding five unrelated responsibilities: the FastAPI app, two
+schemas, the in-memory store, the business rules, and four route handlers. Finding anything
+meant scrolling past everything.
+
+### What problem existed before it
+
+One file that could only grow. Every future phase — a database, a repository, a service, an
+Excel importer — would have added to the same module.
+
+### New concepts
+
+- `APIRouter`, `include_router`, router `prefix` and `tags`
+- Regular packages, `__init__.py`, and dotted imports
+- Empty-string route paths under a prefix, and why `"/"` differs
+- Refactor verification by before/after diffing rather than spot checks
+- Model docstrings being published in the OpenAPI schema
+
+### Things I still do not fully understand
+
+- The store (`invoices`, `next_id`) now lives in the router module. That is fine while it is
+  temporary, but is module-level mutable state in a router ever acceptable long-term, or is
+  Phase 6's database the only real answer?
+- When routers grow, does `include_router` support nesting routers inside routers, and is
+  that ever a good idea?
+- Should `GET /` live in `main.py`, or belong to a `health` router once Phase 30 adds
+  `/health` and `/ready`?
+
+### One architecture decision I can now explain
+
+**Why this structure arrived in Phase 5 and not Phase 0.**
+
+The final tree in the playbook has ten directories — `api`, `core`, `db`, `models`,
+`schemas`, `repositories`, `services`, `messaging`, `storage`, plus workers and lambdas.
+Creating that on day one is the obvious move, and it is the wrong one.
+
+Empty folders are claims about a design you have not tested. A `repositories/` directory
+created before there is a database asserts that persistence will need an abstraction, that
+this is where it goes, and that its boundary sits exactly there. Those may turn out true, but
+in Phase 0 they are guesses, and guesses embedded in a directory tree are harder to abandon
+than guesses in a function — nobody deletes a folder that "we'll need eventually," so the
+project accretes structure it never earned.
+
+The trigger to split was concrete and observable: the file got hard to read. That is a fact
+about the code, not a prediction about it. Everything moved here already existed and was
+already working, which is why the diff could be empty — the split was recognizing a boundary
+that had formed on its own rather than imposing one in advance.
+
+The same logic governs what did *not* move. `validate_invoice()` is still in the router,
+sharing a file with HTTP concerns. That is a real smell, and Phase 9 exists to fix it. Fixing
+it now would mean two phases doing one phase's work, and the reason for the service layer
+would be "the folder was there" instead of "business rules and transport concerns were
+tangled and it hurt."
+
+### Interview questions I should be able to answer
+
+1. What does `APIRouter` do, and how does it relate to the `FastAPI` app object?
+2. Why is `@router.get("")` under a prefix different from `@router.get("/")`?
+3. How would you prove a refactor changed no behavior?
+4. Why not start a project with the directory structure it will eventually need?
+5. What is `__init__.py` for, and what happens without it?
+6. Why do the business rules still live in the router after this refactor?

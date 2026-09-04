@@ -1,59 +1,15 @@
-from datetime import date, datetime, timezone
-from decimal import Decimal
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException
 
-app = FastAPI(title="InvoiceFlow API")
+from app.schemas.invoice import InvoiceCreate, InvoiceRead
+
+router = APIRouter(prefix="/invoices", tags=["invoices"])
 
 # Temporary storage. This list lives in the server process's memory, so every
 # invoice is lost when the process restarts. Phase 6 replaces it with PostgreSQL.
 invoices = []
 next_id = 1
-
-
-class InvoiceCreate(BaseModel):
-    """The shape of an invoice a client is allowed to send.
-
-    This describes structure only: which fields are required and what type each
-    one is. Whether the numbers make sense together is a separate question, and
-    Phase 4 answers it.
-
-    Amounts use Decimal rather than float because binary floats cannot represent
-    values like 0.10 exactly, so their arithmetic drifts. On money that drift
-    becomes a cent that does not reconcile.
-    """
-
-    invoice_number: str
-    vendor: str
-    invoice_date: date
-    currency: str
-    subtotal: Decimal
-    tax: Decimal
-    total: Decimal
-
-
-class InvoiceRead(BaseModel):
-    """The shape of an invoice the API returns.
-
-    Deliberately a separate class rather than a subclass of InvoiceCreate. The
-    two describe opposite directions of travel and are free to diverge: a field
-    the client sends need not be a field the API echoes back, and vice versa.
-    `id`, `status` and `created_at` are assigned by the server, so a client can
-    never supply them.
-    """
-
-    id: int
-    invoice_number: str
-    vendor: str
-    invoice_date: date
-    currency: str
-    subtotal: Decimal
-    tax: Decimal
-    total: Decimal
-    status: str
-    created_at: datetime
-
 
 SUPPORTED_CURRENCIES = {"EUR", "USD", "GBP"}
 
@@ -71,7 +27,8 @@ def validate_invoice(invoice: InvoiceCreate) -> list[dict]:
 
     This function deliberately knows nothing about HTTP. It returns data and
     lets the caller decide what that means, which is what will let the Excel
-    importer in Phase 20 reuse it without having a request to fail.
+    importer in Phase 20 reuse it without having a request to fail. Phase 9
+    moves it out of this router and into a service layer for the same reason.
     """
     issues = []
 
@@ -122,12 +79,10 @@ def validate_invoice(invoice: InvoiceCreate) -> list[dict]:
     return issues
 
 
-@app.get("/")
-def read_root():
-    return {"message": "InvoiceFlow API"}
-
-
-@app.post("/invoices", response_model=InvoiceRead, status_code=201)
+# The route paths are "" rather than "/". Under the router's "/invoices" prefix
+# an empty path produces exactly /invoices, while "/" would produce /invoices/
+# and make the old URL a redirect.
+@router.post("", response_model=InvoiceRead, status_code=201)
 def create_invoice(invoice: InvoiceCreate):
     global next_id
 
@@ -146,12 +101,12 @@ def create_invoice(invoice: InvoiceCreate):
     return stored
 
 
-@app.get("/invoices", response_model=list[InvoiceRead])
+@router.get("", response_model=list[InvoiceRead])
 def list_invoices():
     return invoices
 
 
-@app.get("/invoices/{invoice_id}", response_model=InvoiceRead)
+@router.get("/{invoice_id}", response_model=InvoiceRead)
 def get_invoice(invoice_id: int):
     for invoice in invoices:
         if invoice["id"] == invoice_id:
