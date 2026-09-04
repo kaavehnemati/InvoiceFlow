@@ -2,11 +2,10 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 5 — routers and package structure. The application is split into an
-`app/` package with separate router and schema modules. Invoices are checked for sense, not
-just shape, before being accepted, but they are still held in a plain Python list inside the
-server process. There is no database, no repository, and no service layer yet. Each is
-introduced by a later
+**Current status:** Phase 6 — PostgreSQL and SQLAlchemy. Invoices are persisted in a real
+database, so restarting the server no longer loses them. Routes still talk to the database
+session directly: there is no repository and no service layer yet, and schema changes are not
+yet versioned. Each is introduced by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -14,10 +13,59 @@ and only once the previous phase makes the need for it obvious.
 
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/) for environment and dependency management
+- PostgreSQL 16
 
 > The system Python on this machine ships without `pip` and without `ensurepip`, so
 > `python3 -m venv` cannot bootstrap itself. `uv` handles both the virtual environment and
 > the installs without needing `sudo`.
+
+## Database
+
+The application needs a PostgreSQL database before it will start.
+
+```bash
+sudo service postgresql start
+sudo -u postgres psql -c "CREATE ROLE invoiceflow LOGIN PASSWORD 'invoiceflow';"
+sudo -u postgres createdb -O invoiceflow invoiceflow
+```
+
+Confirm it is reachable — this should print `1`:
+
+```bash
+psql "postgresql://invoiceflow:invoiceflow@localhost:5432/invoiceflow" -c "select 1"
+```
+
+### Connection
+
+The connection string is read from the `DATABASE_URL` environment variable. If it is unset,
+the application falls back to the local development default:
+
+```text
+postgresql+psycopg://invoiceflow:invoiceflow@localhost:5432/invoiceflow
+```
+
+The `+psycopg` suffix selects the psycopg 3 driver. To point at a different database:
+
+```bash
+DATABASE_URL="postgresql+psycopg://user:pass@host:5432/dbname" uv run uvicorn app.main:app
+```
+
+`invoiceflow/invoiceflow` is a local development credential, not a secret, and no real
+credential belongs in source. Phase 11 replaces this single `os.getenv` call with a settings
+object and a `.env.example`.
+
+### Tables
+
+Tables are created on startup by `Base.metadata.create_all()` in [app/main.py](app/main.py).
+That call only ever *adds* missing tables — it cannot alter an existing one, so editing a
+column in the model will silently do nothing to a database that already has the table. Phase
+7 replaces this with Alembic migrations, which is the real answer.
+
+To reset the database during development:
+
+```bash
+psql "$DATABASE_URL" -c "TRUNCATE invoices RESTART IDENTITY"
+```
 
 ## Setup
 
@@ -213,8 +261,10 @@ playbook introduces each fix only once the problem is visible.
 
 | Limitation | Try it | Resolved by |
 | --- | --- | --- |
-| Restarting the server erases every invoice, and IDs restart at 1 | create an invoice, restart, then `GET /invoices` → `[]` | Phase 6 — PostgreSQL |
 | The same invoice can be submitted any number of times | `POST` an identical invoice twice → two `201`s, two IDs | Phase 9 — duplicate detection on `vendor + invoice_number` |
+| Amounts with more than 2 decimal places are **silently rounded** by the database, which can break an invoice that passed validation | `POST` `subtotal:"0.005", tax:"0.005", total:"0.010"` → `201`, stored as `0.01 + 0.01 = 0.01` | unowned — see below |
+| A database error surfaces as a bare `500` | `POST` an amount above `9999999999.99` → `500 Internal Server Error` | Phase 12 — exception handling |
+| Model changes do not reach an existing database | edit a column, restart → nothing happens | Phase 7 — Alembic |
 | An invoice is a header only; there are no line items, so the totals are asserted rather than derived | nothing sums to `subtotal` | Phase 15 — invoice items |
 
 One thing worth knowing about the current validation: **unknown fields are ignored, not
@@ -222,14 +272,36 @@ rejected.** `{"...": ..., "nonsense": true}` succeeds and `nonsense` is simply d
 is Pydantic's default; a typo like `vendour` therefore surfaces as *"vendor: Field
 required"* rather than as a complaint about `vendour`.
 
+### The rounding gap, in detail
+
+Business rules run on the Pydantic `Decimal` values. The database applies `NUMERIC(12,2)`
+*afterwards*, and PostgreSQL rounds to scale rather than refusing:
+
+```text
+submitted   subtotal 0.005 + tax 0.005 == total 0.010    validation passes
+stored      subtotal 0.01  + tax 0.01  != total 0.01     no longer true
+```
+
+Verified against the table: `SELECT (subtotal + tax = total)` returns `f` for that row. An
+invoice can therefore satisfy `TOTAL_MISMATCH` on the way in and violate it in storage.
+
+The fix is a business rule — amounts must carry at most two decimal places — which belongs
+with the other rules rather than being smuggled in as part of a persistence change. It is
+recorded here rather than fixed silently.
+
 ## Project layout
 
 ```text
 .
 ├── app/
-│   ├── main.py              # FastAPI app; mounts the routers
+│   ├── main.py              # FastAPI app; creates tables, mounts the routers
+│   ├── db/
+│   │   ├── base.py          # Base — the declarative registry
+│   │   └── session.py       # DATABASE_URL, engine, SessionLocal
+│   ├── models/
+│   │   └── invoice.py       # Invoice — the "invoices" table
 │   ├── routers/
-│   │   └── invoices.py      # Invoice routes, business rules, in-memory store
+│   │   └── invoices.py      # Invoice routes, business rules, DB queries
 │   └── schemas/
 │       └── invoice.py       # InvoiceCreate, InvoiceRead
 ├── requirements.txt         # Pinned dependencies
@@ -238,12 +310,18 @@ required"* rather than as a complaint about `vendour`.
 └── InvoiceFlow_Claude_Code_Implementation_Playbook.md
 ```
 
+`models/` and `schemas/` both contain a file called `invoice.py`, and the distinction
+matters: `models/invoice.py` is the SQLAlchemy table, `schemas/invoice.py` is the pair of
+Pydantic models describing what crosses the API boundary. They carry similar fields today and
+are free to diverge — a column can exist without being exposed.
+
 The split happened in Phase 5 for one reason: `main.py` had reached 159 lines and held five
 unrelated things at once — the app object, both schemas, the store, the business rules, and
 every route. It was not done because layered folders are inherently better. A project this
 size does not need them until reading it becomes annoying, and that is the signal to act on.
 
 Note what is *not* separated yet. `validate_invoice()` still lives in the router next to the
-routes it serves, so HTTP concerns and business rules share a file. That is deliberate: Phase
-9 introduces the service layer, and its job is to move exactly those rules out. Splitting
-them now would leave that phase with nothing to demonstrate.
+routes it serves, and so do the SQLAlchemy queries — so HTTP concerns, business rules, and
+persistence all share one file. That is deliberate. Phase 8 extracts the repository, Phase 9
+the service layer, and Phase 10 replaces the hand-rolled `SessionLocal()` calls with injected
+dependencies. Doing any of it now would leave those phases with nothing to demonstrate.
