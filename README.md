@@ -2,10 +2,11 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 4 — business validation. Invoices are now checked for sense, not
-just shape, before being accepted. They are still held in a plain Python list inside the
-server process. There is no database and no architecture layers yet. Each is introduced by a
-later
+**Current status:** Phase 5 — routers and package structure. The application is split into an
+`app/` package with separate router and schema modules. Invoices are checked for sense, not
+just shape, before being accepted, but they are still held in a plain Python list inside the
+server process. There is no database, no repository, and no service layer yet. Each is
+introduced by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -28,11 +29,11 @@ uv pip install -r requirements.txt
 ## Run
 
 ```bash
-uv run uvicorn main:app --reload
+uv run uvicorn app.main:app --reload
 ```
 
-`main:app` means: import the module `main`, then serve the object named `app` inside it.
-`--reload` restarts the server whenever a source file changes, which is convenient in
+`app.main:app` means: import the module `app.main`, then serve the object named `app` inside
+it. `--reload` restarts the server whenever a source file changes, which is convenient in
 development and should never be used in production.
 
 ## Verify
@@ -225,9 +226,24 @@ required"* rather than as a complaint about `vendour`.
 
 ```text
 .
-├── main.py            # The entire application, for now
-├── requirements.txt   # Pinned dependencies
+├── app/
+│   ├── main.py              # FastAPI app; mounts the routers
+│   ├── routers/
+│   │   └── invoices.py      # Invoice routes, business rules, in-memory store
+│   └── schemas/
+│       └── invoice.py       # InvoiceCreate, InvoiceRead
+├── requirements.txt         # Pinned dependencies
 ├── docs/
 │   └── learning-log.md
 └── InvoiceFlow_Claude_Code_Implementation_Playbook.md
 ```
+
+The split happened in Phase 5 for one reason: `main.py` had reached 159 lines and held five
+unrelated things at once — the app object, both schemas, the store, the business rules, and
+every route. It was not done because layered folders are inherently better. A project this
+size does not need them until reading it becomes annoying, and that is the signal to act on.
+
+Note what is *not* separated yet. `validate_invoice()` still lives in the router next to the
+routes it serves, so HTTP concerns and business rules share a file. That is deliberate: Phase
+9 introduces the service layer, and its job is to move exactly those rules out. Splitting
+them now would leave that phase with nothing to demonstrate.
