@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class InvoiceCreate(BaseModel):
@@ -34,6 +34,10 @@ class InvoiceRead(BaseModel):
     `id`, `status` and `created_at` are assigned by the server, so a client can
     never supply them.
     """
+
+    # Build from an object's attributes, not just a dict, so a route can return
+    # a SQLAlchemy Invoice row directly and have it read field by field.
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
     invoice_number: str

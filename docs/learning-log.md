@@ -693,3 +693,163 @@ tangled and it hurt."
 4. Why not start a project with the directory structure it will eventually need?
 5. What is `__init__.py` for, and what happens without it?
 6. Why do the business rules still live in the router after this refactor?
+
+---
+
+## Phase 6 — PostgreSQL + SQLAlchemy
+
+### What I learned
+
+**ORM** — object-relational mapping. `Invoice` is a Python class; `invoices` is a PostgreSQL
+table; SQLAlchemy translates between them. Assigning an attribute becomes an `UPDATE`,
+`session.add()` becomes an `INSERT`, and a query returns objects instead of tuples.
+
+**Table vs model.** There are now two files called `invoice.py`, and the difference is the
+point:
+
+```text
+app/schemas/invoice.py    Pydantic   what crosses the API boundary
+app/models/invoice.py     SQLAlchemy what is stored in PostgreSQL
+```
+
+They carry similar fields today and are not the same thing. A column can exist without being
+exposed; a response field can be computed rather than stored.
+
+**Engine.** Created once per process, owns the connection pool, and does not connect until a
+statement actually runs. It is configuration, not a connection.
+
+**Session.** A *unit of work*. It tracks the objects it has seen, batches the SQL, and holds
+a transaction open until told otherwise. `SessionLocal` is a factory — `SessionLocal()` opens
+one, and the `with` block closes it.
+
+**Commit and refresh are two different ideas, and this phase made that concrete.**
+
+```python
+session.add(db_invoice)
+session.commit()          # write the transaction; the row now exists
+session.refresh(db_invoice)  # re-read it, so Python can see what the DB decided
+```
+
+`commit()` writes. It also *expires* the instance, marking every attribute as unknown. And
+`id` was never in Python to begin with — the database assigned it from a sequence. Without
+`refresh()` the object cannot report its own ID. Two operations because writing and reading
+are two directions.
+
+**Query.** `session.get(Invoice, 1)` fetches by primary key; `session.scalars(select(Invoice)
+.order_by(Invoice.id)).all()` fetches many. The `order_by` is not decoration — the in-memory
+list returned insertion order because it *was* a list, whereas a table has no inherent order.
+Preserving the old behavior meant asking for it explicitly.
+
+**`from_attributes=True`** is what lets `InvoiceRead` be built from an ORM object instead of a
+dict — the answer to the question the Phase 3 log left open.
+
+**`create_all()` only adds missing tables.** It cannot alter one that exists, so editing a
+column and restarting does nothing at all. That is not a bug, it is the boundary of the tool,
+and it is precisely why Phase 7 exists.
+
+### Why this phase was needed
+
+Phase 1 built storage the crudest possible way and left the defect in place for five phases:
+restarting the process erased everything. The point was to make the reason for a database an
+observation rather than an assumption. Verified, before and after:
+
+```text
+Phase 1:  POST, POST, restart, GET /invoices  ->  []
+Phase 6:  POST × 6,      restart, GET /invoices  ->  6 invoices, ids [1..6]
+                                  next POST     ->  id 7, not 1
+```
+
+### What problem existed before it
+
+All application state lived in one process's memory. It could not survive a restart, could
+not be shared between processes, could not be queried, and could not be inspected by any tool
+other than the API itself.
+
+### New concepts
+
+- ORM, declarative models, `Mapped` / `mapped_column`
+- Engine, connection pool, `Session` as a unit of work
+- `commit()`, expiry-on-commit, `refresh()`
+- Database-assigned identity columns and sequences
+- `NUMERIC(precision, scale)` as the exact-decimal column type
+- `from_attributes` for reading Pydantic models out of ORM objects
+- `create_all()` and its inability to migrate
+
+### Two things I got wrong, and what they cost
+
+**1. I predicted `NUMERIC(12,2)` would reject a third decimal place. It rounds.**
+
+PostgreSQL raises an error only when the *integer* part exceeds the precision; excess scale
+is rounded silently. Verified:
+
+```text
+POST subtotal 0.005, tax 0.005, total 0.010   -> 201 Created
+stored:      0.01        0.01        0.01
+SELECT (subtotal + tax = total)               -> f
+```
+
+Business rules run on the Pydantic `Decimal`; the database applies its scale afterwards. So an
+invoice can satisfy `TOTAL_MISMATCH` on the way in and violate it in storage. Recorded as a
+known limitation rather than patched, because the fix is a new business rule and that is a
+different phase's category.
+
+The general lesson: **validation and storage constrain the same value in different places, and
+nothing automatically keeps the two agreeing.**
+
+**2. A database error escapes as a bare `500`.**
+
+```text
+POST subtotal 99999999999.00  ->  500 Internal Server Error
+log: sqlalchemy.exc.DataError: (psycopg.errors.NumericValueOutOfRange)
+```
+
+Nothing catches `DataError`, so FastAPI's default handler returns an opaque 500 and the real
+cause lives only in the server log. Phase 12 owns exception handling and is where this belongs.
+
+### Things I still do not fully understand
+
+- Each route opens its own session, so a request that read and then wrote would use two
+  transactions. When does that start to matter, and is that what Phase 22's transaction
+  boundaries are about?
+- The session is closed by the `with` block, but the ORM object is returned afterwards and
+  still serializes fine. Why does closing detach without expiring?
+- `autoflush=False` was set without a clear reason beyond "fewer surprises." What would
+  actually go wrong with it on?
+- Is `String(3)` on `currency` doing real work, given the business rule already restricts it
+  to three known values?
+
+### One architecture decision I can now explain
+
+**Why routes talk to the database directly here, when Phase 8 will say they must not.**
+
+Every route now contains `with SessionLocal() as session:` and SQLAlchemy calls, so a single
+function knows about HTTP status codes, business rules, and transactions at once. The playbook
+explicitly permits this — *"For this phase, direct database access inside the router is
+acceptable"* — and then spends Phase 8 taking it away.
+
+That sequencing is the lesson. A repository is an indirection, and indirections are only worth
+their cost against a problem you can point at. Writing `InvoiceRepository` before any SQL
+exists means designing an interface for queries nobody has needed, and the usual result is an
+abstraction shaped like the first thing that got written rather than like what the code
+actually does.
+
+By Phase 8 there will be three routes with session handling copy-pasted between them, a
+duplicate check to add in Phase 9 that needs a fourth query, and tests in Phase 14 that want
+to run without a live PostgreSQL. Those are concrete pressures, and the repository's shape
+follows from them rather than from a guess.
+
+What makes waiting safe is that the alternative is not "no structure" — it is *reversible*
+structure. The queries are three lines in three functions. Moving them later is mechanical.
+Building the wrong abstraction first is what is expensive, because everything downstream is
+written against it.
+
+### Interview questions I should be able to answer
+
+1. What is the difference between a SQLAlchemy model and a Pydantic schema?
+2. What does a `Session` represent, and how does it differ from a connection?
+3. Why is `session.refresh()` needed after `session.commit()`?
+4. Why is `NUMERIC` the right column type for money, and what is wrong with `FLOAT`?
+5. What happens to a value with three decimal places in a `NUMERIC(12,2)` column?
+6. Why does `create_all()` not solve schema changes?
+7. Why does the list endpoint need an explicit `ORDER BY`?
+8. Why is it acceptable — for now — for a route handler to run SQL directly?
