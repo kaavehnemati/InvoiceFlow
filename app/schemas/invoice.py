@@ -49,3 +49,4 @@ class InvoiceRead(BaseModel):
     total: Decimal
     status: str
     created_at: datetime
+    updated_at: datetime
