@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import DateTime, Numeric, String
@@ -33,3 +33,10 @@ class Invoice(Base):
     total: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     status: Mapped[str] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # onupdate fires on UPDATE only, so the insert must set this explicitly.
+    # Nothing updates an invoice yet — Phase 39's approve/reject is the first
+    # thing that will, and this column is what will record it.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

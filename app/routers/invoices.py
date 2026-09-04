@@ -91,10 +91,14 @@ def create_invoice(invoice: InvoiceCreate):
         raise HTTPException(status_code=422, detail=issues)
 
     with SessionLocal() as session:
+        now = datetime.now(timezone.utc)
         db_invoice = Invoice(
             **invoice.model_dump(),
             status="VALID",
-            created_at=datetime.now(timezone.utc),
+            created_at=now,
+            # An invoice that has never been modified was last changed when it
+            # was created. The model's onupdate takes over from here.
+            updated_at=now,
         )
         session.add(db_invoice)
         session.commit()

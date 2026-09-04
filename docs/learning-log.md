@@ -853,3 +853,135 @@ written against it.
 6. Why does `create_all()` not solve schema changes?
 7. Why does the list endpoint need an explicit `ORDER BY`?
 8. Why is it acceptable — for now — for a route handler to run SQL directly?
+
+---
+
+## Phase 7 — Alembic Migrations
+
+### What I learned
+
+**Migration** — a file describing one change to the schema, with the code to apply it and the
+code to undo it. The schema stops being whatever happened to run against the database and
+becomes a reviewable, version-controlled sequence.
+
+**Revision** — each migration's identifier, plus a pointer to the one before it. That forms a
+chain, and `alembic_version` is a one-row table recording where a given database sits on it:
+
+```text
+<base> -> 1187a8364717  create invoices table
+1187a8364717 -> e4fd0b79bf05  add updated_at to invoices  (head)
+```
+
+The same chain applied to any empty database produces the same schema. That is the whole
+value.
+
+**Upgrade and downgrade.** `alembic upgrade head` applies everything outstanding;
+`downgrade -1` undoes the last one. Verified as a round trip: the `updated_at` column
+disappeared and came back, and `downgrade base` → `upgrade head` rebuilt the schema from
+nothing.
+
+**`create_all()` had to go.** Leaving it would mean two mechanisms defining the schema, and
+the one that cannot alter anything would usually win. Proved it is gone by starting the app
+against an empty database: it serves requests happily and creates no tables.
+
+### The lesson of the phase: autogenerate drafts, it does not decide
+
+Adding `updated_at` to the model and running `--autogenerate` produced one line:
+
+```python
+op.add_column('invoices',
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False))
+```
+
+Applied to a table with one row in it:
+
+```text
+psycopg.errors.NotNullViolation: column "updated_at" of relation "invoices"
+contains null values
+```
+
+Obvious in hindsight. Adding a `NOT NULL` column means every existing row instantly violates
+the constraint, and there is no value to give them. Autogenerate compares *two schemas*. It
+never looks at the rows, so it cannot know whether the table holds zero rows or ten million
+— and against an empty table its one-liner is perfectly correct.
+
+The fix is the standard three-step:
+
+```python
+op.add_column("invoices", sa.Column("updated_at", ..., nullable=True))  # 1 permit nulls
+op.execute("UPDATE invoices SET updated_at = created_at")               # 2 backfill
+op.alter_column("invoices", "updated_at", nullable=False)               # 3 enforce
+```
+
+Step 2 is a *decision*, not a mechanism: an invoice that has never been modified was last
+changed when it was created. No tool could have chosen that.
+
+The same trap applies to renames — autogenerate sees a dropped column and an added one, and
+emits `DROP` + `ADD`, which silently destroys the data instead of moving it.
+
+### Why this phase was needed
+
+Phase 6 left the schema defined by `create_all()`, which only ever adds missing tables. A
+column change to the model did nothing to an existing database, and it did nothing *silently*
+— no error, no warning. There was also no record of what the schema was meant to be, so it
+could not be reproduced on another machine, reviewed in a pull request, or reversed.
+
+### What problem existed before it
+
+The database's shape existed only as an accident of history. Reproducing it meant dropping
+everything and starting over, which is not available in production.
+
+### New concepts
+
+- Migration, revision, revision chain, `head`, `base`
+- `alembic_version` as the pointer into that chain
+- `upgrade` / `downgrade` as inverse operations
+- `--autogenerate` as schema diffing, and its blindness to data
+- The add-nullable → backfill → enforce pattern
+- Keeping the connection string in one place (`env.py` reads `DATABASE_URL`; `alembic.ini`'s
+  placeholder is inert)
+
+### Things I still do not fully understand
+
+- Two people branching from the same revision would create two heads. How is that merge
+  resolved?
+- `op.alter_column(..., nullable=False)` takes a table lock. On a large table, how long, and
+  what is the zero-downtime alternative?
+- Should migrations run automatically at deploy, or as a separate step? Phase 43's CD
+  pipeline will have to answer this.
+- `downgrade` is easy for a column addition. Is it ever honest for a migration that dropped
+  data, or is the real answer "restore from backup"?
+
+### One architecture decision I can now explain
+
+**Why production databases must never depend on manual schema edits.**
+
+A hand-run `ALTER TABLE` works and is faster than writing a migration. What it does not do is
+leave evidence. Nobody can tell later whether it ran, whether it ran on staging as well as
+production, whether the person who ran it typed `varchar(50)` or `varchar(500)`, or how to
+undo it. A new environment cannot be built, because the instructions were never written down
+— they existed for a moment in somebody's terminal.
+
+A migration turns each of those into a property of the repository. The change is a file, so
+it is reviewed like code. `alembic_version` records what has been applied, so drift between
+environments is a query rather than an argument. `downgrade` makes the reverse a plan instead
+of an improvisation.
+
+The deeper point is that the schema is part of the application, not part of the infrastructure
+it happens to sit on. Code and schema change together — `updated_at` in the model is
+meaningless without the column, and the column is dead weight without the model. Keeping them
+in the same repository, advancing through the same review, is what keeps them consistent.
+
+That is also why `create_all()` had to be deleted rather than kept as a convenience. Two paths
+to a schema means two answers to "what does this database look like," and the one that cannot
+migrate is the one that silently does nothing.
+
+### Interview questions I should be able to answer
+
+1. What is a database migration, and why not just run `ALTER TABLE` by hand?
+2. What does `alembic upgrade head` actually do?
+3. Why can `--autogenerate` produce a migration that fails in production but passes locally?
+4. How do you add a `NOT NULL` column to a table that already has rows?
+5. Why is `create_all()` not a substitute for migrations?
+6. What happens when two developers each add a migration on the same parent revision?
+7. Where should the database connection string live, and why not in `alembic.ini`?
