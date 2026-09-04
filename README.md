@@ -2,9 +2,9 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 7 — Alembic migrations. Invoices are persisted in PostgreSQL and
-the schema is a versioned sequence of migrations. Routes still talk to the database session
-directly: there is no repository and no service layer yet. Each is introduced by a later
+**Current status:** Phase 8 — repository layer. Persistence has moved out of the routes into
+`InvoiceRepository`, so no route contains SQL any more. Business rules still live in the
+router, and there is no service layer yet. Each is introduced by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -342,8 +342,10 @@ recorded here rather than fixed silently.
 │   │   └── session.py       # DATABASE_URL, engine, SessionLocal
 │   ├── models/
 │   │   └── invoice.py       # Invoice — the "invoices" table
+│   ├── repositories/
+│   │   └── invoice_repository.py   # All invoice SQL lives here
 │   ├── routers/
-│   │   └── invoices.py      # Invoice routes, business rules, DB queries
+│   │   └── invoices.py      # Invoice routes and business rules
 │   └── schemas/
 │       └── invoice.py       # InvoiceCreate, InvoiceRead
 ├── migrations/
@@ -366,8 +368,20 @@ unrelated things at once — the app object, both schemas, the store, the busine
 every route. It was not done because layered folders are inherently better. A project this
 size does not need them until reading it becomes annoying, and that is the signal to act on.
 
-Note what is *not* separated yet. `validate_invoice()` still lives in the router next to the
-routes it serves, and so do the SQLAlchemy queries — so HTTP concerns, business rules, and
-persistence all share one file. That is deliberate. Phase 8 extracts the repository, Phase 9
-the service layer, and Phase 10 replaces the hand-rolled `SessionLocal()` calls with injected
-dependencies. Doing any of it now would leave those phases with nothing to demonstrate.
+Phase 8 moved persistence out. `InvoiceRepository` owns every SQLAlchemy call, and the
+routes now read as: validate, then ask the repository. The split follows one rule the
+repository is not allowed to break —
+
+> **The repository handles persistence only.** It does not decide whether totals are valid,
+> whether a currency is supported, or whether an invoice should be accepted. Handed a
+> nonsense invoice, it stores the nonsense faithfully.
+
+That is deliberate, not an oversight. It is what lets the Excel importer (Phase 20) and the
+document extractor (Phase 38) save invoices through the same class without inheriting the
+HTTP layer's idea of what is valid.
+
+Note what is *still* not separated. `validate_invoice()` remains in the router, so business
+rules and HTTP concerns share a file, and the routes still open sessions and construct the
+repository by hand. Phase 9 moves the rules into a service; Phase 10 replaces the manual
+wiring with injected dependencies. Doing either now would leave those phases with nothing to
+demonstrate.
