@@ -55,6 +55,73 @@ class InvoiceRead(BaseModel):
     created_at: datetime
 
 
+SUPPORTED_CURRENCIES = {"EUR", "USD", "GBP"}
+
+
+def validate_invoice(invoice: InvoiceCreate) -> list[dict]:
+    """Check an invoice against the business rules.
+
+    InvoiceCreate already guarantees the invoice has the right *shape*. These
+    rules decide whether it makes sense: an invoice whose fields are all the
+    correct type can still claim that 1000 + 190 = 1300.
+
+    Returns one issue per broken rule, or an empty list if the invoice is
+    valid. Every rule is checked rather than stopping at the first failure, so
+    a client learns everything that is wrong in a single response.
+
+    This function deliberately knows nothing about HTTP. It returns data and
+    lets the caller decide what that means, which is what will let the Excel
+    importer in Phase 20 reuse it without having a request to fail.
+    """
+    issues = []
+
+    for field in ("subtotal", "tax", "total"):
+        if getattr(invoice, field) < 0:
+            issues.append(
+                {
+                    "code": "NEGATIVE_AMOUNT",
+                    "field": field,
+                    "message": f"{field} must not be negative",
+                }
+            )
+
+    if invoice.subtotal + invoice.tax != invoice.total:
+        issues.append(
+            {
+                "code": "TOTAL_MISMATCH",
+                "field": "total",
+                "message": (
+                    f"subtotal ({invoice.subtotal}) + tax ({invoice.tax}) "
+                    f"must equal total ({invoice.total})"
+                ),
+            }
+        )
+
+    today = datetime.now(timezone.utc).date()
+    if invoice.invoice_date > today:
+        issues.append(
+            {
+                "code": "FUTURE_INVOICE_DATE",
+                "field": "invoice_date",
+                "message": f"invoice_date {invoice.invoice_date} is in the future",
+            }
+        )
+
+    if invoice.currency not in SUPPORTED_CURRENCIES:
+        issues.append(
+            {
+                "code": "INVALID_CURRENCY",
+                "field": "currency",
+                "message": (
+                    f"currency must be one of "
+                    f"{', '.join(sorted(SUPPORTED_CURRENCIES))}"
+                ),
+            }
+        )
+
+    return issues
+
+
 @app.get("/")
 def read_root():
     return {"message": "InvoiceFlow API"}
@@ -63,12 +130,15 @@ def read_root():
 @app.post("/invoices", response_model=InvoiceRead, status_code=201)
 def create_invoice(invoice: InvoiceCreate):
     global next_id
-    # Every invoice starts as DRAFT because nothing has checked it yet. Phase 4
-    # adds the business rules that decide whether it becomes VALID or REJECTED.
+
+    issues = validate_invoice(invoice)
+    if issues:
+        raise HTTPException(status_code=422, detail=issues)
+
     stored = {
         "id": next_id,
         **invoice.model_dump(),
-        "status": "DRAFT",
+        "status": "VALID",
         "created_at": datetime.now(timezone.utc),
     }
     next_id += 1

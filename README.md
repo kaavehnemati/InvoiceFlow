@@ -2,10 +2,9 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 3 — response models and HTTP semantics. Requests and responses are
-now two separately declared contracts, and status codes are meaningful. The invoices
-themselves are still held in a plain Python list inside the server process. There is no
-database, no business validation, and no architecture layers yet. Each is introduced by a
+**Current status:** Phase 4 — business validation. Invoices are now checked for sense, not
+just shape, before being accepted. They are still held in a plain Python list inside the
+server process. There is no database and no architecture layers yet. Each is introduced by a
 later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
@@ -78,8 +77,56 @@ and a client can never supply.
 | Field | Type | Notes |
 | --- | --- | --- |
 | `id` | integer | Assigned on create |
-| `status` | string | Always `DRAFT` until Phase 4 |
+| `status` | string | `VALID` — an invoice is only stored if it passes every business rule |
 | `created_at` | datetime | UTC |
+
+## Business rules
+
+Passing the schema means an invoice has the right *shape*. These rules decide whether it
+makes *sense*. An invoice that breaks any of them is refused with `422` and is not stored.
+
+| Rule | Issue code |
+| --- | --- |
+| `subtotal >= 0` | `NEGATIVE_AMOUNT` |
+| `tax >= 0` | `NEGATIVE_AMOUNT` |
+| `total >= 0` | `NEGATIVE_AMOUNT` |
+| `subtotal + tax == total` | `TOTAL_MISMATCH` |
+| `invoice_date <= today` (UTC) | `FUTURE_INVOICE_DATE` |
+| `currency in {EUR, USD, GBP}` | `INVALID_CURRENCY` |
+
+All rules are evaluated on every request, so one response reports everything that is wrong:
+
+```bash
+curl -X POST http://127.0.0.1:8000/invoices -H 'Content-Type: application/json' \
+  -d '{"invoice_number":"INV-9","vendor":"V","invoice_date":"2099-12-31",
+       "currency":"XYZ","subtotal":"-5","tax":"-5","total":"9999"}'
+```
+
+```json
+{"detail":[
+  {"code":"NEGATIVE_AMOUNT","field":"subtotal","message":"subtotal must not be negative"},
+  {"code":"NEGATIVE_AMOUNT","field":"tax","message":"tax must not be negative"},
+  {"code":"TOTAL_MISMATCH","field":"total","message":"subtotal (-5) + tax (-5) must equal total (9999)"},
+  {"code":"FUTURE_INVOICE_DATE","field":"invoice_date","message":"invoice_date 2099-12-31 is in the future"},
+  {"code":"INVALID_CURRENCY","field":"currency","message":"currency must be one of EUR, GBP, USD"}
+]}
+```
+
+Currency matching is case-sensitive: `"eur"` is rejected. Normalizing input casing is Phase
+18's job, where Excel rows arrive in whatever form a spreadsheet happened to contain.
+
+### Two kinds of 422
+
+Schema failures and business failures share the same status code but carry different bodies,
+so a client tells them apart by which keys are present:
+
+| Failure | Body shape |
+| --- | --- |
+| Schema (Pydantic) | `{"type", "loc", "msg", "input"}` |
+| Business rule | `{"code", "field", "message"}` |
+
+Both mean "well-formed JSON the server will not process." Unifying them, if it is ever worth
+doing, belongs to Phase 12, which owns exception-to-HTTP translation.
 
 ### Status codes
 
@@ -166,7 +213,8 @@ playbook introduces each fix only once the problem is visible.
 | Limitation | Try it | Resolved by |
 | --- | --- | --- |
 | Restarting the server erases every invoice, and IDs restart at 1 | create an invoice, restart, then `GET /invoices` → `[]` | Phase 6 — PostgreSQL |
-| Fields are type-checked but not *sensible*: totals need not add up, dates may be in the future, and any currency string is accepted. Every invoice is therefore stuck in `DRAFT` | `POST` with `subtotal:"1000", tax:"190", total:"9999", currency:"XYZ", invoice_date:"2099-12-31"` → `201 DRAFT` | Phase 4 — business validation |
+| The same invoice can be submitted any number of times | `POST` an identical invoice twice → two `201`s, two IDs | Phase 9 — duplicate detection on `vendor + invoice_number` |
+| An invoice is a header only; there are no line items, so the totals are asserted rather than derived | nothing sums to `subtotal` | Phase 15 — invoice items |
 
 One thing worth knowing about the current validation: **unknown fields are ignored, not
 rejected.** `{"...": ..., "nonsense": true}` succeeds and `nonsense` is simply dropped. This
