@@ -2,10 +2,11 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 2 — Pydantic request models. Invoice submissions are validated
-against a declared schema, but the invoices themselves are still held in a plain Python list
-inside the server process. There is no database, no business validation, and no architecture
-layers yet. Each is introduced by a later
+**Current status:** Phase 3 — response models and HTTP semantics. Requests and responses are
+now two separately declared contracts, and status codes are meaningful. The invoices
+themselves are still held in a plain Python list inside the server process. There is no
+database, no business validation, and no architecture layers yet. Each is introduced by a
+later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -56,10 +57,12 @@ With the server running:
 
 ### Examples
 
-### Request schema
+### Schemas
 
-`POST /invoices` requires all seven fields. Anything missing or of the wrong type is
-rejected with `422` before the handler runs.
+The request and response contracts are declared separately, and both appear in `/docs`.
+
+**`InvoiceCreate`** — what a client sends. All seven fields are required; anything missing or
+of the wrong type is rejected with `422` before the handler runs.
 
 | Field | Type |
 | --- | --- |
@@ -69,19 +72,40 @@ rejected with `422` before the handler runs.
 | `currency` | string |
 | `subtotal`, `tax`, `total` | decimal |
 
+**`InvoiceRead`** — what the API returns: the same seven fields plus three the server assigns
+and a client can never supply.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | integer | Assigned on create |
+| `status` | string | Always `DRAFT` until Phase 4 |
+| `created_at` | datetime | UTC |
+
+### Status codes
+
+| Code | When |
+| --- | --- |
+| `201 Created` | Invoice created |
+| `200 OK` | Invoice or list returned |
+| `404 Not Found` | No invoice with that ID |
+| `422 Unprocessable Entity` | Request failed schema validation |
+
 ### Examples
 
 Create an invoice:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/invoices \
+curl -i -X POST http://127.0.0.1:8000/invoices \
   -H 'Content-Type: application/json' \
   -d '{"invoice_number":"INV-001","vendor":"ABC GmbH","invoice_date":"2026-09-04",
-       "currency":"EUR","subtotal":1000.00,"tax":190.00,"total":1190.00}'
+       "currency":"EUR","subtotal":"1000.00","tax":"190.00","total":"1190.00"}'
 ```
 
+```text
+HTTP/1.1 201 Created
+```
 ```json
-{"id":1,"invoice_number":"INV-001","vendor":"ABC GmbH","invoice_date":"2026-09-04","currency":"EUR","subtotal":1000.0,"tax":190.0,"total":1190.0}
+{"id":1,"invoice_number":"INV-001","vendor":"ABC GmbH","invoice_date":"2026-09-04","currency":"EUR","subtotal":"1000.00","tax":"190.00","total":"1190.00","status":"DRAFT","created_at":"2026-09-04T16:29:41.764554Z"}
 ```
 
 The server assigns the `id`. List them, then fetch one:
@@ -102,6 +126,38 @@ curl -X POST http://127.0.0.1:8000/invoices -H 'Content-Type: application/json' 
 {"detail":[{"type":"missing","loc":["body","invoice_number"],"msg":"Field required"}, ...]}
 ```
 
+Requesting an invoice that does not exist:
+
+```bash
+curl -i http://127.0.0.1:8000/invoices/999
+```
+
+```text
+HTTP/1.1 404 Not Found
+```
+```json
+{"detail":"Invoice not found"}
+```
+
+## Sending money
+
+**Send amounts as JSON strings, not JSON numbers.** Both are accepted, but only strings
+survive the round trip intact:
+
+| Sent | Returned |
+| --- | --- |
+| `"subtotal": "1000.00"` | `"1000.00"` — exact |
+| `"subtotal": 1000.00` | `"1000.0"` — scale lost |
+| `"tax": "0.10"` | `"0.10"` — exact |
+| `"tax": 0.10` | `"0.1"` — scale lost |
+
+A JSON *number* is parsed as a binary float before it can become a `Decimal`, and the float
+has no memory of how many digits were written. A JSON *string* is handed to `Decimal`
+verbatim. For invoices the difference is whether `1000.00` still reads as an amount in cents.
+
+Responses always serialize amounts as strings, because that is the only JSON type that can
+carry a decimal exactly.
+
 ## Known limitations
 
 Every item below is a deliberate consequence of the current phase, not an oversight. The
@@ -110,18 +166,12 @@ playbook introduces each fix only once the problem is visible.
 | Limitation | Try it | Resolved by |
 | --- | --- | --- |
 | Restarting the server erases every invoice, and IDs restart at 1 | create an invoice, restart, then `GET /invoices` → `[]` | Phase 6 — PostgreSQL |
-| Fields are type-checked but not *sensible*: totals need not add up, dates may be in the future, and any currency string is accepted | `POST` with `subtotal:1000, tax:190, total:9999, currency:"XYZ", invoice_date:"2099-12-31"` → `200` | Phase 4 — business validation |
-| A missing invoice returns `200 null` instead of `404` | `GET /invoices/999` → `null` | Phase 3 — HTTP semantics |
-| Creating returns `200`, not `201 Created` | `curl -i -X POST /invoices` | Phase 3 — HTTP semantics |
+| Fields are type-checked but not *sensible*: totals need not add up, dates may be in the future, and any currency string is accepted. Every invoice is therefore stuck in `DRAFT` | `POST` with `subtotal:"1000", tax:"190", total:"9999", currency:"XYZ", invoice_date:"2099-12-31"` → `201 DRAFT` | Phase 4 — business validation |
 
-Two things worth knowing about the current validation:
-
-- **Amounts come back as JSON numbers.** They are `Decimal` inside the application, but JSON
-  has no decimal type, so `1000.00` is serialized as `1000.0`. Precision is kept where the
-  arithmetic happens and negotiated at the boundary.
-- **Unknown fields are ignored, not rejected.** `{"...": ..., "nonsense": true}` succeeds and
-  `nonsense` is simply dropped. This is Pydantic's default; a typo like `vendour` therefore
-  surfaces as *"vendor: Field required"* rather than as a complaint about `vendour`.
+One thing worth knowing about the current validation: **unknown fields are ignored, not
+rejected.** `{"...": ..., "nonsense": true}` succeeds and `nonsense` is simply dropped. This
+is Pydantic's default; a typo like `vendour` therefore surfaces as *"vendor: Field
+required"* rather than as a complaint about `vendour`.
 
 ## Project layout
 
