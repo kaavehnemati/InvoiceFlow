@@ -179,3 +179,126 @@ ordering is designed so each layer answers a pain that already exists.
    when you run more than one instance behind a load balancer?
 4. Why does `GET /invoices/abc` return 422 while `POST /invoices` accepts any JSON at all?
 5. Why would you deliberately build a version you already know is wrong?
+
+---
+
+## Phase 2 — Pydantic Request Models
+
+### What I learned
+
+**Pydantic** turns a class of type-annotated attributes into a validator. `InvoiceCreate` is
+not documentation — it is the executable rule for what a client may send.
+
+**Automatic validation.** Annotating the parameter `invoice: InvoiceCreate` is the entire
+integration. FastAPI reads the annotation, validates the body against it, and returns 422
+with field-level detail *before the handler runs*. The handler never sees a malformed
+invoice, so it needs no defensive checks:
+
+```text
+POST {"nonsense": true}
+→ 422, seven errors, one per missing required field:
+  invoice_number, vendor, invoice_date, currency, subtotal, tax, total
+```
+
+Errors carry a `loc` path pointing at the exact field — `["body","vendor"]` — which is what
+makes a 422 actionable for a client instead of just a rejection.
+
+**Type hints do real work here.** In most Python, annotations are inert; the interpreter
+ignores them. Pydantic reads them at class-creation time and compiles a validator from them.
+The same syntax that was a comment for a human becomes enforcement.
+
+**OpenAPI schema generation.** The model is published at
+`components.schemas.InvoiceCreate`, with `required` listing all seven fields, and `/docs`
+renders it as a fillable form. One class definition produced the validator *and* the public
+API documentation — they cannot drift apart, because they are the same source.
+
+**Why `Decimal` rather than `float` for money.** Binary floating point cannot represent
+`0.10` exactly, so errors accumulate: `0.1 + 0.2 == 0.30000000000000004`. On invoices that
+is a cent that fails to reconcile, and it compounds across line items. `Decimal` stores
+base-10 digits exactly, so `Decimal("0.1") + Decimal("0.2") == Decimal("0.3")` holds. This
+becomes concrete in Phase 4, where `subtotal + tax == total` must be true as written rather
+than true-to-within-epsilon.
+
+**A wrinkle worth knowing.** JSON has no decimal type — only `number`. So amounts are
+`Decimal` inside the application but serialize as floats on the way out: posting `1000.00`
+returns `1000.0`. The right conclusion is not "Decimal was pointless" but that precision is
+preserved where arithmetic happens and negotiated at the boundary. Systems that cannot
+tolerate that boundary loss transmit money as an integer count of minor units, or as a
+string.
+
+**Lax coercion is the default.** `{"subtotal": "1000"}` is accepted and converted, while
+`{"subtotal": "abc"}` is rejected. Pydantic converts when a conversion is unambiguous. Strict
+mode exists but was not needed to satisfy this phase.
+
+### Why this phase was needed
+
+Phase 1 accepted `{"nonsense": true}` and stored it as an invoice. Every layer built above
+that — business rules, a database schema, an import pipeline — would have inherited the
+assumption that stored invoices have invoice-shaped fields, when nothing guaranteed it.
+Validation belongs at the edge, where bad input can still be rejected cheaply.
+
+### What problem existed before it
+
+The request body was annotated `dict`, which told FastAPI only "parse JSON". Required fields,
+types, and date formats were all unchecked. Payloads with no invoice data at all were stored
+and returned with an assigned ID.
+
+### New concepts
+
+- Pydantic `BaseModel` as an executable input contract
+- Validation at the boundary, before handler code runs
+- Field-level error reporting (`type`, `loc`, `msg`, `input`)
+- OpenAPI schema generated from the same class that enforces the rules
+- `Decimal` vs binary float for monetary values, and the JSON boundary problem
+- Lax vs strict type coercion
+- Structural validation as distinct from business validation
+
+### Things I still do not fully understand
+
+- What happens to `Decimal` precision once PostgreSQL is involved in Phase 6 — is `NUMERIC`
+  the column type that preserves it, and does SQLAlchemy return `Decimal` back?
+- Whether `extra="forbid"` would be the better default for a real public API, given that
+  ignoring unknown keys silently swallows client typos
+- How Pydantic v2 can be this fast if it validates every request — where does the compiled
+  validator actually live?
+- Whether `date` should be `datetime` with a timezone for invoices crossing jurisdictions
+
+### One architecture decision I can now explain
+
+**Why structural validation and business validation are deliberately separate jobs.**
+
+The model now guarantees an invoice *has the shape of* an invoice. It still permits this:
+
+```json
+{"subtotal": 1000, "tax": 190, "total": 9999,
+ "currency": "XYZ", "invoice_date": "2099-12-31"}
+```
+
+Verified: that returns `200`. Every field is the right type, and the document is nonsense —
+the arithmetic is wrong, the currency does not exist, and the invoice is dated 73 years in
+the future.
+
+The two kinds of validation answer different questions and have different lifetimes.
+"Is `subtotal` a decimal?" is a property of the wire format; it is true in every deployment
+and will never change. "Is `EUR` a currency we accept?" is a policy decision that varies by
+customer and changes without the API contract changing. Encoding the second as
+`Literal["EUR","USD","GBP"]` in the request schema would freeze a business rule into the
+published OpenAPI document, and every currency the company adds would become a breaking
+schema change.
+
+Keeping them apart also puts the rules where every input path can reach them. Phase 20 must
+run identical validation on Excel imports, and Phase 38 on invoices extracted from PDFs by
+OCR. Neither arrives as an HTTP request body, so neither passes through this model — but
+both must satisfy the same business rules. That is what Phase 9's service layer is for, and
+it only works if the rules were never trapped in the HTTP schema.
+
+### Interview questions I should be able to answer
+
+1. What is the difference between a Pydantic schema and structural validation on one hand,
+   and business rules on the other? Give an example that passes one and fails the other.
+2. Why use `Decimal` instead of `float` for monetary amounts?
+3. If amounts serialize to JSON floats anyway, what did `Decimal` actually buy you?
+4. Where does the content of `/docs` come from, and why can it not drift from the validation?
+5. What does a 422 response body contain, and why does `loc` matter to an API client?
+6. Why not put the list of supported currencies in the request model?
+7. What is the difference between lax and strict type coercion in Pydantic?

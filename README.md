@@ -2,9 +2,10 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 1 — in-memory invoice API. Invoices are created and read through
-HTTP, but they are held in a plain Python list inside the server process. There is no
-database, no field validation, and no architecture layers yet. Each is introduced by a later
+**Current status:** Phase 2 — Pydantic request models. Invoice submissions are validated
+against a declared schema, but the invoices themselves are still held in a plain Python list
+inside the server process. There is no database, no business validation, and no architecture
+layers yet. Each is introduced by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -55,16 +56,32 @@ With the server running:
 
 ### Examples
 
+### Request schema
+
+`POST /invoices` requires all seven fields. Anything missing or of the wrong type is
+rejected with `422` before the handler runs.
+
+| Field | Type |
+| --- | --- |
+| `invoice_number` | string |
+| `vendor` | string |
+| `invoice_date` | date, `YYYY-MM-DD` |
+| `currency` | string |
+| `subtotal`, `tax`, `total` | decimal |
+
+### Examples
+
 Create an invoice:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/invoices \
   -H 'Content-Type: application/json' \
-  -d '{"invoice_number":"INV-001","vendor":"ABC GmbH","subtotal":1000,"tax":190,"total":1190}'
+  -d '{"invoice_number":"INV-001","vendor":"ABC GmbH","invoice_date":"2026-09-04",
+       "currency":"EUR","subtotal":1000.00,"tax":190.00,"total":1190.00}'
 ```
 
 ```json
-{"id":1,"invoice_number":"INV-001","vendor":"ABC GmbH","subtotal":1000,"tax":190,"total":1190}
+{"id":1,"invoice_number":"INV-001","vendor":"ABC GmbH","invoice_date":"2026-09-04","currency":"EUR","subtotal":1000.0,"tax":190.0,"total":1190.0}
 ```
 
 The server assigns the `id`. List them, then fetch one:
@@ -72,6 +89,17 @@ The server assigns the `id`. List them, then fetch one:
 ```bash
 curl http://127.0.0.1:8000/invoices
 curl http://127.0.0.1:8000/invoices/1
+```
+
+A malformed submission names the offending field:
+
+```bash
+curl -X POST http://127.0.0.1:8000/invoices -H 'Content-Type: application/json' \
+  -d '{"nonsense":true}'
+```
+
+```json
+{"detail":[{"type":"missing","loc":["body","invoice_number"],"msg":"Field required"}, ...]}
 ```
 
 ## Known limitations
@@ -82,13 +110,18 @@ playbook introduces each fix only once the problem is visible.
 | Limitation | Try it | Resolved by |
 | --- | --- | --- |
 | Restarting the server erases every invoice, and IDs restart at 1 | create an invoice, restart, then `GET /invoices` → `[]` | Phase 6 — PostgreSQL |
-| Any JSON is accepted; no field is required, typed, or checked | `POST /invoices -d '{"nonsense":true}'` succeeds | Phase 2 — Pydantic |
+| Fields are type-checked but not *sensible*: totals need not add up, dates may be in the future, and any currency string is accepted | `POST` with `subtotal:1000, tax:190, total:9999, currency:"XYZ", invoice_date:"2099-12-31"` → `200` | Phase 4 — business validation |
 | A missing invoice returns `200 null` instead of `404` | `GET /invoices/999` → `null` | Phase 3 — HTTP semantics |
 | Creating returns `200`, not `201 Created` | `curl -i -X POST /invoices` | Phase 3 — HTTP semantics |
 
-One thing *is* already validated: `invoice_id` is annotated `int`, so `GET /invoices/abc`
-returns `422` automatically. FastAPI enforces exactly what it has been told the shape of —
-which is the argument for describing request bodies too, in Phase 2.
+Two things worth knowing about the current validation:
+
+- **Amounts come back as JSON numbers.** They are `Decimal` inside the application, but JSON
+  has no decimal type, so `1000.00` is serialized as `1000.0`. Precision is kept where the
+  arithmetic happens and negotiated at the boundary.
+- **Unknown fields are ignored, not rejected.** `{"...": ..., "nonsense": true}` succeeds and
+  `nonsense` is simply dropped. This is Pydantic's default; a typo like `vendour` therefore
+  surfaces as *"vendor: Field required"* rather than as a complaint about `vendour`.
 
 ## Project layout
 
