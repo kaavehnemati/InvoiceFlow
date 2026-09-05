@@ -1833,3 +1833,157 @@ either audience paying for the other — the same event, rendered for whoever is
 5. What should never appear in a log, and what should never appear in a response?
 6. How would you turn these logs into the metrics Phase 44 asks for?
 7. Why does a catch-all `Exception` handler not break a more specific one?
+
+---
+
+## Phase 14 — Automated Testing Foundation
+
+### What I learned
+
+**Fifty tests in a third of a second, with one command.**
+
+```text
+$ uv run pytest
+48 passed, 2 xfailed in 0.35s
+```
+
+Four categories, as the playbook asks: unit (pure rules), service (rules plus the database),
+repository (real SQL), API (`TestClient`), plus two of my own — architecture rules, and a
+concurrency case documenting a known gap.
+
+**Transaction rollback as test isolation.** Each test gets a connection with an open
+transaction that is rolled back afterwards:
+
+```python
+session = Session(bind=connection, join_transaction_mode="create_savepoint")
+```
+
+Without `create_savepoint` this would not work at all, because
+`InvoiceRepository.create()` calls `session.commit()` — that commit would end the outer
+transaction and leave nothing to roll back. With it, the session's commits release savepoints
+and the outer rollback still undoes everything. The development database began with 5 rows,
+ids 1–5, and had exactly the same 5 rows after every run.
+
+**Rollback hides writes, not reads.** The first run failed with `assert 409 == 201`: the
+default invoice number already existed among the pre-existing dev rows. Isolation from a
+test's *own* writes says nothing about data that was committed before it started. The fix is
+one line in the fixture — delete existing rows inside the transaction, so each test sees an
+empty table and the rollback restores them.
+
+**`dependency_overrides` earned its keep.** One line points the whole application at the
+test's transaction:
+
+```python
+app.dependency_overrides[get_db] = lambda: db_session
+```
+
+Because `get_invoice_repository` and `get_invoice_service` both descend from `get_db`,
+overriding the one redirects everything below it. Phase 10 built that chain deliberately; this
+is the first time it was used for its actual purpose.
+
+**Architecture rules can be tests.** Every phase since Phase 9 has ended with me manually
+checking that the service imports no FastAPI. That check is now five assertions over the AST,
+and it runs automatically.
+
+### The most valuable thing I did was try to break it
+
+A suite that has never failed is a suite of unknown value, so I deliberately broke three
+things:
+
+```text
+1. remove GBP from SUPPORTED_CURRENCIES  ->  45 passed.  NOT CAUGHT.
+2. make create() return a tuple again    ->  8 tests failed
+3. reimport HTTPException in the router  ->  architecture test failed
+```
+
+Break 1 exposed a real hole. Every currency test asserted that *bad* values are rejected —
+`XYZ`, `eur` — and none asserted that the supported ones are accepted. Deleting a currency
+from the whitelist was invisible.
+
+**Testing what a rule forbids says nothing about what it permits.** Adding
+`test_supported_currencies_are_accepted` parametrized over EUR/USD/GBP closed it, and rerunning
+break 1 then failed on `[GBP]` exactly as it should.
+
+I would not have found that by writing more tests. I found it by asking what the tests would
+fail to notice.
+
+### Why this phase was needed
+
+Every phase since Phase 1 was verified by replaying a `capture.py` battery by hand and diffing
+it against the previous phase. That caught real problems — the Phase 5 docstring change, the
+Phase 9 duplicate behavior — but it lived in a scratch directory, was never committed, needed a
+running server, and required a human to read a diff.
+
+It also settles a debt. Back in Phase 1 the playbook contradicted itself: §4.4 demands tests
+every behavior-changing phase, while Phase 14 is where pytest arrives. We chose phase isolation
+and verified manually on the understanding that this phase would pay it back. From Phase 15,
+§4.4 applies normally.
+
+### What problem existed before it
+
+No committed tests. No way for anyone else to check the project works. No protection against
+a regression except my own attention.
+
+### New concepts
+
+- pytest fixtures, composition, and `parametrize`
+- Transaction rollback as isolation; `join_transaction_mode="create_savepoint"`
+- `TestClient` and dependency overrides as a test seam
+- `xfail(strict=True)` as executable documentation of a known defect
+- Architecture rules expressed as assertions over the AST
+- Mutation-style checking: break the code on purpose to measure the suite
+
+### Things I still do not fully understand
+
+- The suite shares one database with development. It works, but two `pytest` runs at once
+  would collide. Is a separate test database the answer, or per-worker databases?
+- `test_concurrency.py` really commits and cleans up in a `finally`. If it were killed
+  mid-test it would leave rows behind. Is that acceptable for a test documenting a race?
+- `TestClient` emits a deprecation warning about `httpx2`. Worth chasing now or later?
+- Nothing measures coverage. Would that have found the currency hole, or would it have shown
+  those lines as covered — since the rule *was* executed, just never with a passing value?
+
+### One architecture decision I can now explain
+
+**Why the tests were quick to write, and what that says about the earlier phases.**
+
+`test_validation.py` constructs a service with **no repository at all**:
+
+```python
+service = InvoiceService(repository=None)
+```
+
+and tests fifteen rules against it. No database, no fixtures, no HTTP. That is only possible
+because of two decisions made for entirely different reasons: Phase 9 moved the rules out of
+the router so they did not need a request, and Phase 12 moved the duplicate check out of
+`validate()` so it did not need a database.
+
+Neither was made for testing. Phase 9's reason was that a rule needing the database could not
+live in a router; Phase 12's was that a duplicate of a malformed invoice is not a conflict.
+Testability came out as a by-product.
+
+The same pattern holds throughout. The service can be tested without HTTP because Phase 12
+gave it domain exceptions instead of `HTTPException`. The API can be tested without a real
+database because Phase 10 built a dependency chain with a single override point. The
+repository can be tested against real SQL in isolation because Phase 8 gave it a session
+rather than letting it open one.
+
+**Testability is not a feature you add; it is what code looks like when its dependencies point
+in one direction and are supplied from outside.** The projects where tests are painful to
+write are usually the ones where a function reaches out for what it needs — a global session,
+a module-level config, a framework's request object — instead of being handed it. Every one of
+those reaches was removed in an earlier phase for a reason that had nothing to do with
+testing, and the bill for writing this suite came due at almost nothing.
+
+Which is also the argument for why this phase comes at 14 and not at 1. Tests written in Phase
+1 would have tested a Python list. Tests written now describe an architecture worth protecting.
+
+### Interview questions I should be able to answer
+
+1. How do you isolate tests that share a database without wiping it between runs?
+2. What does `join_transaction_mode="create_savepoint"` solve?
+3. Why did rolling back not stop pre-existing rows from breaking a test?
+4. How would you point a FastAPI app's tests at a different database without editing routes?
+5. What is `xfail(strict=True)` for, and why not just delete the test?
+6. How do you know whether your test suite is any good?
+7. Why is a rule that only tests rejection an incomplete test of that rule?

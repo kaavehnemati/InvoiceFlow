@@ -2,10 +2,11 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 13 — logging. The three layers are wired by FastAPI, configuration
-comes from a validated settings object, errors are raised as domain exceptions that a single
-translation layer turns into HTTP responses, and the application now says what it is doing.
-There are no automated tests yet. That is addressed by a later
+**Current status:** Phase 14 — testing foundation. The three layers are wired by FastAPI,
+configuration comes from a validated settings object, errors are raised as domain exceptions
+that a single translation layer turns into HTTP responses, the application logs what it does,
+and 50 tests run in under a second. Invoices are still header-only, with no line items. That
+is addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -134,6 +135,68 @@ LOG_LEVEL=VERBOSE uv run uvicorn app.main:app
 `invoiceflow/invoiceflow` is a local development credential, not a secret. `.env` is
 gitignored precisely so it can hold real values locally without being committed; production
 credentials belong in a secret store, which Phase 41 and Phase 45 cover.
+
+## Testing
+
+```bash
+uv run pytest
+```
+
+One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
+
+```text
+48 passed, 2 xfailed in 0.35s
+```
+
+| File | Category | Tests |
+| --- | --- | --- |
+| `test_validation.py` | unit — pure rules, no database | 15 |
+| `test_service.py` | service — rules plus duplicates | 8 |
+| `test_repository.py` | integration — real SQL | 7 |
+| `test_api.py` | API — `TestClient`, status codes | 14 |
+| `test_architecture.py` | the layering rules, as assertions | 5 |
+| `test_concurrency.py` | the duplicate race (`xfail`) | 1 |
+
+### Your development data is safe
+
+Tests run against the same database the application uses, but nothing they do survives. Each
+test gets a connection with an open transaction that is rolled back afterwards:
+
+```python
+session = Session(bind=connection, join_transaction_mode="create_savepoint")
+```
+
+`create_savepoint` is the part that matters. `InvoiceRepository.create()` calls
+`session.commit()`, and without it that commit would end the outer transaction and leave
+nothing to roll back. With it, those commits release savepoints instead.
+
+The fixture also deletes existing rows at the start — inside the transaction — so every test
+sees an empty table, and the rollback puts them straight back.
+
+### The architecture tests
+
+Five rules that earlier phases established are checked automatically rather than by eye:
+
+- the service imports no FastAPI (Phase 12)
+- domain exceptions import no FastAPI
+- the router never imports `HTTPException` (Phase 12)
+- the router contains no SQL calls (Phase 8)
+- only `config.py` reads the environment (Phase 11)
+
+They fail the moment someone reintroduces the coupling those phases removed.
+
+### The two `xfail` tests
+
+Two defects are known, documented, and deliberately unfixed. They are written as tests marked
+`xfail` with `strict=True`, so they are executable documentation — and the day someone fixes
+one, pytest reports `XPASS` and the suite fails until the marker is removed.
+
+```text
+XFAIL test_scale_rounding_preserves_totals  — the rounding gap
+XFAIL test_concurrent_creates_cannot_both_succeed — the duplicate race
+```
+
+Both are described under [Known limitations](#known-limitations).
 
 ## Logging
 
@@ -475,6 +538,15 @@ recorded here rather than fixed silently.
 │   ├── env.py               # Alembic config; reads DATABASE_URL
 │   └── versions/            # One file per schema change
 ├── alembic.ini
+├── tests/
+│   ├── conftest.py          # Rolled-back session, client, factories
+│   ├── test_validation.py   # Unit — pure rules, no database
+│   ├── test_service.py      # Service — rules plus duplicates
+│   ├── test_repository.py   # Integration — real SQL
+│   ├── test_api.py          # API — TestClient, status codes
+│   ├── test_architecture.py # The layering rules, as assertions
+│   └── test_concurrency.py  # The duplicate race (xfail)
+├── pytest.ini
 ├── .env.example             # Every setting, with dev defaults
 ├── requirements.txt         # Pinned dependencies
 ├── docs/
