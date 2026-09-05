@@ -2146,3 +2146,127 @@ their own history.
 5. Why report only `INVALID_QUANTITY` when the totals also fail to reconcile?
 6. Why is `git checkout --` the wrong way to undo an experiment on uncommitted work?
 7. A test suite passes when you delete a rounding call. What does that tell you?
+
+---
+
+## Phase 16 — Standard Excel Template
+
+### What I learned
+
+**File responses.** A route can return bytes instead of a model:
+
+```python
+return Response(
+    content=build_template_workbook(),
+    media_type=XLSX_MEDIA_TYPE,
+    headers={"Content-Disposition": f'attachment; filename="{TEMPLATE_FILENAME}"'},
+)
+```
+
+`Content-Disposition: attachment` is what makes a browser save the file under a name rather
+than trying to render it. The media type for `.xlsx` is the mouthful
+`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`.
+
+**A test caught something I had got wrong about the documentation.** I added a `responses=`
+block expecting it to declare the route as returning a spreadsheet, and asserted that
+`application/json` was *absent*. It was not:
+
+```text
+{'application/json': {...},
+ 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': {}}
+```
+
+`responses=` **adds** a content type; it does not replace the default. Removing the JSON needs
+`response_class=Response` on the decorator. Without that, a generated client would expect JSON
+from an endpoint that returns a zip archive. I would not have noticed by looking at `/docs`,
+because the xlsx entry was there and looked right.
+
+**Contract tests are worth writing longhand.** The column list is asserted against eleven
+literal strings rather than against `COLUMN_NAMES`:
+
+```python
+PLAYBOOK_COLUMNS = ["invoice_number", "vendor", ...]
+assert list(COLUMN_NAMES) == PLAYBOOK_COLUMNS
+```
+
+Comparing the constant to itself would pass no matter what anyone changed. Verified by
+breaking it three ways — renaming a column, reordering one, and adding a stray data row — and
+each was caught.
+
+**An empty data sheet is a design decision.** The Instructions sheet carries the worked
+example instead, because anything sitting in the sheet a user types into is something they can
+forget to delete and then import as a real invoice from "ABC GmbH".
+
+**Reading the file back with `file(1)`** rather than trusting the test: `Microsoft Excel
+2007+`, 6646 bytes, opened in a separate process. A `.xlsx` is a zip archive, so "did it
+produce bytes" and "did it produce a workbook" are genuinely different questions.
+
+### Why this phase was needed
+
+Invoices could only arrive one at a time, as JSON, from something that speaks HTTP. A finance
+team with 300 invoices in a spreadsheet had no way in. This phase does not build the import —
+it publishes the contract the import will expect, which has to exist before anyone can prepare
+a file to send.
+
+### What problem existed before it
+
+No file format, and therefore nothing for a user to fill in and nothing for Phase 17 to
+validate against.
+
+### New concepts
+
+- Returning raw bytes from a route; `Content-Disposition`, media types
+- `response_class` versus `responses=` in OpenAPI documentation
+- openpyxl workbooks, sheets, styling, `freeze_panes`
+- Publishing a data contract as an artifact rather than as prose
+- Versioning a file format, and where the version has to live to be useful
+- Writing assertions against literals when testing a contract
+
+### Things I still do not fully understand
+
+- The workbook is rebuilt on every request. It is small and static — is caching it worth the
+  staleness risk, or is that premature?
+- `Content-Disposition` filenames with non-ASCII characters need `filename*=UTF-8''...`. Not
+  an issue here, but when does it become one?
+- Phase 17 will read `template_version` back. What should happen at version 2 — reject an old
+  file, or accept it and map the columns?
+- Excel will happily reformat a `YYYY-MM-DD` string into a locale date on open. Does the
+  parser in Phase 18 need to cope with a cell that comes back as a `datetime` rather than a
+  string?
+
+### One architecture decision I can now explain
+
+**Why the template is generated from a constant rather than committed as a file.**
+
+Committing `template.xlsx` to the repository would be simpler: the endpoint becomes
+`FileResponse(path)`, there is no openpyxl dependency in the request path, and the file is
+exactly what a designer produced. It is also how the two halves of an import quietly stop
+agreeing.
+
+Phase 17 has to validate that an uploaded workbook has the expected worksheet and the required
+columns. With a committed binary, those columns exist twice — once inside a file nobody
+diffs, and once in the validation code. Nothing keeps them equal. Someone adds a column to the
+spreadsheet, the validator does not learn about it, and the failure appears months later as
+"the template you gave me does not import."
+
+Generating from `COLUMNS` means there is one definition. The writer renders it; the reader
+checks against it; a change to either is a change to both. The test that asserts the eleven
+names against literals is the outer guard — it makes any change to that definition
+deliberate rather than incidental.
+
+The general shape: **when two components must agree about a format, the format should be a
+value they share, not a document they each interpret.** A committed binary is a document. A
+tuple of column definitions is a value. The playbook calls the template "a documented public
+contract", and a contract that exists in two places is not one contract.
+
+The same reasoning put the version inside the workbook rather than only in its filename. A
+filename is metadata the environment can strip; a cell travels with the file.
+
+### Interview questions I should be able to answer
+
+1. How do you return a file from a FastAPI route, and what makes a browser download it?
+2. What is the difference between `responses=` and `response_class` in OpenAPI docs?
+3. Why generate a template file instead of committing one?
+4. Why should a test compare a contract to literals rather than to the constant defining it?
+5. Where should a file format's version live, and why is the filename not enough?
+6. Why keep the worked example off the sheet the user types into?

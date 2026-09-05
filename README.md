@@ -2,11 +2,11 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 15 — invoice items. Invoices now carry line items whose amounts are
-derived by the server, and the declared totals are checked against them. Behind that: three
-layers wired by FastAPI, a validated settings object, domain exceptions translated to HTTP in
-one place, structured logging, and 80 tests. There is no file import yet. That is addressed
-by a later
+**Current status:** Phase 16 — Excel import template. The import contract is published as a
+downloadable `.xlsx`. Behind it: invoices with line items whose amounts are derived and
+reconciled, three layers wired by FastAPI, a validated settings object, domain exceptions
+translated to HTTP in one place, structured logging, and 92 tests. Nothing can be uploaded
+yet. That is addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -136,6 +136,71 @@ LOG_LEVEL=VERBOSE uv run uvicorn app.main:app
 gitignored precisely so it can hold real values locally without being committed; production
 credentials belong in a secret store, which Phase 41 and Phase 45 cover.
 
+## Excel import template
+
+```bash
+curl -OJ http://127.0.0.1:8000/templates/invoice-import
+# invoiceflow-invoice-import-template-v1.xlsx
+```
+
+The template is a **public contract**, not a convenience. It defines exactly what an import
+file must look like, and from Phase 17 the upload validator checks arriving files against the
+same definition — the column list in
+[app/services/excel_template.py](app/services/excel_template.py) is the only copy, so what we
+hand out and what we accept cannot drift apart. The workbook is generated per request rather
+than committed as a binary for the same reason.
+
+### Columns
+
+Every column is required on **every row**. One row per line item, so an invoice with three
+lines takes three rows, repeating the invoice-level columns on each.
+
+| Column | Format | Notes |
+| --- | --- | --- |
+| `invoice_number` | text | With `vendor`, groups rows into one invoice |
+| `vendor` | text | Part of the grouping key |
+| `invoice_date` | `YYYY-MM-DD` | Not in the future |
+| `item` | text | The API calls this `description` |
+| `quantity` | number, ≤3 decimals | Greater than 0; may be fractional |
+| `unit_price` | number, 2 decimals | Before tax |
+| `tax_rate` | number, 0–100 | **19 means 19%**, not 0.19 |
+| `currency` | `EUR`, `USD`, `GBP` | Uppercase |
+| `declared_subtotal` | number, 2 decimals | Checked against the lines |
+| `declared_tax` | number, 2 decimals | Checked against the lines |
+| `declared_total` | number, 2 decimals | Checked against the lines |
+
+Two column names are mappings rather than passthroughs. `item` is the spreadsheet's word for
+the API's `description`. And `declared_*` is doing real work: on a row those sit beside
+per-line values, and the prefix says they are what the sender *claims* — Phase 20 checks them
+against the sum of the lines, using the reconciliation [Phase 15
+built](#line-items).
+
+### Sheets
+
+| Sheet | Contents |
+| --- | --- |
+| `Invoices` | The header row, and nothing else |
+| `Instructions` | Column reference, formats, and a worked two-row invoice |
+
+The data sheet is deliberately empty below the header. Anything left there is something a user
+can forget to delete and then import as a real invoice, so the worked example lives on the
+Instructions sheet where it cannot be mistaken for data.
+
+### Versioning
+
+The version appears in the filename **and** in the workbook, at `Instructions!B1`:
+
+```text
+invoiceflow-invoice-import-template-v1.xlsx
+template_version    1
+```
+
+A file that has been renamed, emailed, or re-saved still identifies itself — which is exactly
+the case where knowing matters. Phase 17 reads it back so an outdated template can be
+reported as such, rather than failing on a missing column and leaving the user to guess.
+
+Bump `TEMPLATE_VERSION` whenever the columns change.
+
 ## Testing
 
 ```bash
@@ -145,7 +210,7 @@ uv run pytest
 One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 
 ```text
-78 passed, 2 xfailed in 0.85s
+90 passed, 2 xfailed in 0.60s
 ```
 
 | File | Category | Tests |
@@ -156,6 +221,7 @@ One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 | `test_api.py` | API — `TestClient`, status codes | 20 |
 | `test_architecture.py` | the layering rules, as assertions | 5 |
 | `test_items.py` | line items — rules, derivation, storage | 24 |
+| `test_template.py` | the import contract | 12 |
 | `test_concurrency.py` | the duplicate race (`xfail`) | 1 |
 
 ### Your development data is safe
@@ -579,11 +645,13 @@ recorded here rather than fixed silently.
 │   ├── repositories/
 │   │   └── invoice_repository.py   # All invoice SQL lives here
 │   ├── routers/
-│   │   └── invoices.py      # HTTP only: routes, status codes
+│   │   ├── invoices.py      # HTTP only: routes, status codes
+│   │   └── templates.py     # The import template download
 │   ├── schemas/
 │   │   └── invoice.py       # InvoiceCreate, InvoiceRead
 │   └── services/
-│       └── invoice_service.py      # Business rules and invoice creation
+│       ├── invoice_service.py      # Business rules and invoice creation
+│       └── excel_template.py       # The import contract, and the .xlsx builder
 ├── migrations/
 │   ├── env.py               # Alembic config; reads DATABASE_URL
 │   └── versions/            # One file per schema change
@@ -595,6 +663,7 @@ recorded here rather than fixed silently.
 │   ├── test_repository.py   # Integration — real SQL
 │   ├── test_api.py          # API — TestClient, status codes
 │   ├── test_items.py        # Line items — rules, derivation, storage
+│   ├── test_template.py     # The import contract
 │   ├── test_architecture.py # The layering rules, as assertions
 │   └── test_concurrency.py  # The duplicate race (xfail)
 ├── pytest.ini
