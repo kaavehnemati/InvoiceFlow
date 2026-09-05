@@ -72,7 +72,10 @@ def test_the_published_template_filled_in_is_accepted(client):
     assert response.status_code == 201
     body = response.json()
     assert body["id"].startswith("imp_")
-    assert body["status"] == "UPLOADED"
+    # COMPLETED, not UPLOADED: since Phase 20 the file is processed inside the
+    # request, so by the time a response exists the work is done. Phase 32
+    # moves that to a worker, and UPLOADED becomes visible again.
+    assert body["status"] == "COMPLETED"
     assert body["filename"] == "invoices.xlsx"
 
 
@@ -184,7 +187,7 @@ def test_accepted_upload_is_persisted(client, db_session):
 
     job = db_session.get(ImportJob, import_id)
     assert job is not None
-    assert job.status == "UPLOADED"
+    assert job.status == "COMPLETED"
     assert job.created_at is not None
 
 

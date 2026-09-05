@@ -2,12 +2,12 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 19 — grouping. Spreadsheet rows can be parsed and grouped back into
-invoices, though none of it is wired into the endpoint yet. Behind it: upload with structural
-checks, the published import contract, invoices with line items whose amounts are derived and
-reconciled, three layers wired by FastAPI, a validated settings object, domain exceptions
-translated to HTTP in one place, structured logging, and 154 tests. That is addressed by a
-later
+**Current status:** Phase 20 — import report. **Uploading a spreadsheet now creates
+invoices**, and `GET /imports/{id}` reports what happened. Behind it: parsing, grouping,
+structural checks, the published import contract, invoices with line items whose amounts are
+derived and reconciled, three layers wired by FastAPI, a validated settings object, domain
+exceptions translated to HTTP in one place, structured logging, and 170 tests. Per-row error
+reporting is addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -213,15 +213,14 @@ curl -X POST http://127.0.0.1:8000/imports -F "file=@march-invoices.xlsx"
  "created_at":"2026-09-05T19:59:42.800405+03:30"}
 ```
 
-### Structure is not business validation
+The response is the import report — the same thing `GET /imports/{id}` returns.
 
-This endpoint answers one question: **is this a spreadsheet I can read?** It does not look at
-a single invoice. A file whose rows contain negative quantities, a currency that does not
-exist, and totals that do not add up is still *structurally* valid, and returns `201`.
+### Structure is checked before contents
 
-Whether those invoices are any good is Phase 20's question. Keeping the two apart is what
-stops an import report from being an unreadable mix of "column missing" and "invoice INV-1008
-is a duplicate".
+The upload is rejected outright if the file is not a readable workbook with the right columns.
+Only then are the rows parsed, grouped and validated. Keeping the two apart is what stops an
+import report being an unreadable mix of "column missing" and "invoice INV-1008 is a
+duplicate" — and it means a `422` here always means *the file*, never the invoices inside it.
 
 | Check | Issue code |
 | --- | --- |
@@ -232,9 +231,10 @@ is a duplicate".
 | Every required column is present | `MISSING_COLUMNS` |
 | There is at least one data row | `NO_DATA_ROWS` |
 
-Failures return `422` with the same `{code, field, message}` shape as business rules, so a
-client parses one kind of error body. Unlike business rules these stop at the first problem —
-there is nothing useful to say about the columns of a file that is not a workbook.
+Structural failures return `422` with the same `{code, field, message}` shape as business
+rules, so a client parses one kind of error body. Unlike business rules these stop at the
+first problem — there is nothing useful to say about the columns of a file that is not a
+workbook.
 
 The messages are meant to be readable by whoever prepared the file:
 
@@ -254,15 +254,89 @@ a real inconsistency, chosen deliberately: an import id travels through URLs, lo
 conversations, where `imp_78fe620d94f6` is unambiguous about what it refers to and needs no
 parsing at the boundary. Invoice ids never left the database's control.
 
+## The import report
+
+```bash
+curl http://127.0.0.1:8000/imports/imp_61f8cc06a072
+```
+
+```json
+{
+  "id": "imp_61f8cc06a072", "filename": "1-VALID-upload-me.xlsx",
+  "status": "COMPLETED",
+  "total_rows": 2, "valid_rows": 2, "invalid_rows": 0,
+  "invoices_found": 1, "invoices_created": 1,
+  "invoices_failed": 0, "duplicate_invoices": 0
+}
+```
+
+### The pipeline
+
+```text
+upload -> structure -> parse rows -> group into invoices -> InvoiceService.create()
+```
+
+That last step is the point. Imported invoices go through **the same
+`InvoiceService.create()`** a JSON request goes through — not similar rules, the same object,
+raising the same domain exceptions. `tests/test_import_report.py` asserts that the identical
+invoice submitted both ways produces identical issue codes, so reimplementing a rule in the
+import path fails the suite.
+
+### Reading the counts
+
+Row-level and invoice-level counts answer different questions: 57 bad rows might be 57 broken
+invoices or one invoice with 57 lines.
+
+| | |
+| --- | --- |
+| `total_rows` | non-blank data rows — blank rows are not counted |
+| `valid_rows` / `invalid_rows` | rows that parsed, and rows that did not |
+| `invoices_found` | distinct `vendor + invoice_number` groups |
+| `invoices_created` | stored successfully |
+| `invoices_failed` | rejected by a business rule, or by grouping |
+| `duplicate_invoices` | already existed |
+
+Two invariants always hold:
+
+```text
+total_rows     = valid_rows + invalid_rows
+invoices_found = invoices_created + invoices_failed + duplicate_invoices
+```
+
+### `COMPLETED` does not mean everything worked
+
+It means processing ran to the end. The counts carry the outcome — an import with 57 bad rows
+is still `COMPLETED`. `FAILED` means processing itself broke. `PARTIALLY_COMPLETED` is unused
+until Phase 32, where a background worker can genuinely stop halfway.
+
+### A repeated invoice number inside one file is not a duplicate
+
+It is another line item. Grouping is by `vendor + invoice_number`, so two rows sharing both
+are two lines of one invoice — which is exactly how a three-line invoice is expressed.
+
+Duplicates arise against invoices **already stored**. Re-uploading the same file is therefore
+safe:
+
+```text
+first upload  -> created=1  duplicates=0
+second upload -> created=0  duplicates=1
+```
+
+### One bad invoice does not cost the good ones
+
+Each invoice is stored on its own, so a file of ten invoices with one broken imports the other
+nine. Phase 22 makes that boundary deliberate rather than a side effect of where the commit
+happens to be.
+
+Errors are persisted as they are produced — the uploaded file is discarded, so an error not
+written down is gone. Phase 21 turns them into a readable report.
+
 ## Row parsing
 
 A cell is not a value. Excel hands back a float where you wanted a decimal, a `datetime` where
 you wanted a date, and a string with a trailing space nobody can see.
 [app/services/excel_parser.py](app/services/excel_parser.py) is the boundary where that
 becomes typed data — nothing downstream has to think about cells again.
-
-> **Not wired into `POST /imports` yet.** Phase 19 groups the parsed rows into invoices and
-> Phase 20 persists them. Today the parser exists and is tested; the endpoint is unchanged.
 
 ### Normalisation
 
@@ -368,7 +442,7 @@ uv run pytest
 One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 
 ```text
-152 passed, 2 xfailed in 1.8s
+168 passed, 2 xfailed in 4.2s
 ```
 
 | File | Category | Tests |
@@ -383,6 +457,7 @@ One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 | `test_imports.py` | upload and structural validation | 17 |
 | `test_parser.py` | row parsing and normalisation | 22 |
 | `test_grouper.py` | grouping and cross-row consistency | 23 |
+| `test_import_report.py` | the full import pipeline | 16 |
 | `test_concurrency.py` | the duplicate race (`xfail`) | 1 |
 
 ### Your development data is safe
@@ -840,6 +915,7 @@ recorded here rather than fixed silently.
 │   ├── test_imports.py      # Upload and structural validation
 │   ├── test_parser.py       # Cells -> typed rows
 │   ├── test_grouper.py      # Rows -> invoices
+│   ├── test_import_report.py # The full import pipeline
 │   ├── test_architecture.py # The layering rules, as assertions
 │   └── test_concurrency.py  # The duplicate race (xfail)
 ├── pytest.ini

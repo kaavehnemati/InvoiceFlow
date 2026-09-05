@@ -44,3 +44,9 @@ class ImportFileError(InvoiceFlowError):
     def __init__(self, issues: list[dict]):
         self.issues = issues
         super().__init__(f"{len(issues)} structural issue(s)")
+
+
+class ImportJobNotFoundError(InvoiceFlowError):
+    def __init__(self, import_id: str):
+        self.import_id = import_id
+        super().__init__(f"import {import_id} not found")
