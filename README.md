@@ -2,10 +2,10 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 12 — application exceptions. The three layers are wired by FastAPI,
-configuration comes from a validated settings object, and errors are raised as domain
-exceptions that a single translation layer turns into HTTP responses. There is no logging
-yet. That is addressed by a later
+**Current status:** Phase 13 — logging. The three layers are wired by FastAPI, configuration
+comes from a validated settings object, errors are raised as domain exceptions that a single
+translation layer turns into HTTP responses, and the application now says what it is doing.
+There are no automated tests yet. That is addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -103,8 +103,8 @@ Every setting lives in [app/core/config.py](app/core/config.py) and is documente
 | Setting | Default | Read by |
 | --- | --- | --- |
 | `DATABASE_URL` | `postgresql+psycopg://invoiceflow:invoiceflow@localhost:5432/invoiceflow` | the engine and Alembic |
-| `APP_ENV` | `development` | *nothing yet* |
-| `LOG_LEVEL` | `INFO` | *nothing yet — Phase 13* |
+| `APP_ENV` | `development` | the log format — human-readable here, JSON elsewhere |
+| `LOG_LEVEL` | `INFO` | the minimum level that reaches stdout |
 
 Resolution order, first match wins:
 
@@ -134,6 +134,55 @@ LOG_LEVEL=VERBOSE uv run uvicorn app.main:app
 `invoiceflow/invoiceflow` is a local development credential, not a secret. `.env` is
 gitignored precisely so it can hold real values locally without being committed; production
 credentials belong in a secret store, which Phase 41 and Phase 45 cover.
+
+## Logging
+
+The application logs four events to **stdout**. Nothing is written to a file — a container
+writes to its output stream and lets the platform decide where that goes.
+
+| Event | Level | Context |
+| --- | --- | --- |
+| `invoice_created` | `INFO` | `invoice_id`, `invoice_number`, `vendor` |
+| `invoice_rejected` | `INFO` | `invoice_number`, `vendor`, `issue_codes` |
+| `duplicate_detected` | `INFO` | `invoice_number`, `vendor` |
+| `unexpected_error` | `ERROR` | `path`, `method`, `exception_type`, traceback |
+
+The first three are logged by the **service**, not the router, because they are business
+facts rather than HTTP facts — the Excel importer in Phase 20 will emit the same events with
+no request in sight. `unexpected_error` is logged at the request boundary, where it belongs.
+
+Rejections are `INFO`, not `WARNING`. A client sending something invalid and being told so is
+a normal outcome; reserving the higher levels for things that need attention is what keeps
+them meaningful.
+
+`APP_ENV` chooses the format:
+
+```text
+development   INFO     invoice_created  invoice_id=1 invoice_number=INV-001 vendor=ABC GmbH
+
+production    {"timestamp":"2026-09-05T13:47:55+0330","level":"INFO",
+               "logger":"app.services.invoice_service","event":"invoice_created",
+               "invoice_id":1,"invoice_number":"INV-001","vendor":"ABC GmbH"}
+```
+
+`LOG_LEVEL` filters: at `WARNING` the three `INFO` events disappear and `unexpected_error`
+still gets through.
+
+### What is never logged
+
+Credentials, secrets, and full file contents. `DATABASE_URL` contains a password and is read
+at startup, so this is checked rather than assumed — no password, and no connection string,
+appears in any log line.
+
+The same rule applies in the other direction. When an unexpected error occurs the traceback
+goes to the log and the client gets a fixed string:
+
+```json
+{"detail": "Internal server error"}
+```
+
+An exception message can name a table, a column, or a connection string. Whoever is debugging
+has the log; whoever sent the request does not need it.
 
 ## Setup
 
@@ -406,6 +455,7 @@ recorded here rather than fixed silently.
 │   ├── dependencies.py      # get_db -> repository -> service
 │   ├── core/
 │   │   ├── config.py        # Settings — the only reader of the environment
+│   │   ├── logging.py       # Formatters + configure_logging()
 │   │   ├── exceptions.py    # Domain errors; no status codes
 │   │   └── error_handlers.py # The only place mapping errors -> HTTP
 │   ├── db/

@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DataError
@@ -7,6 +9,8 @@ from app.core.exceptions import (
     InvoiceNotFoundError,
     InvoiceValidationError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -73,4 +77,27 @@ def register_exception_handlers(app: FastAPI) -> None:
                     }
                 ]
             },
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
+        # Anything that reaches here is a bug or an outage, not a client error.
+        #
+        # The traceback goes to the log; the client gets a fixed string. That
+        # asymmetry is the point -- an exception message can name a table, a
+        # column, or a connection string, none of which belong in a response
+        # body. Whoever is debugging has the log; whoever sent the request does
+        # not need it.
+        logger.exception(
+            "unexpected_error",
+            extra={
+                "context": {
+                    "path": request.url.path,
+                    "method": request.method,
+                    "exception_type": type(exc).__name__,
+                }
+            },
+        )
+        return JSONResponse(
+            status_code=500, content={"detail": "Internal server error"}
         )
