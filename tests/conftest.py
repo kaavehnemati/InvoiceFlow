@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
+from app.db.base import Base
 from app.db.session import engine
 from app.dependencies import get_db
 from app.main import app
@@ -39,7 +40,14 @@ def db_session():
     #
     # Deleting them here, inside the transaction, gives every test an empty
     # table to reason about; the rollback below puts them straight back.
-    session.execute(delete(Invoice))
+    #
+    # Every table, not a hand-maintained list. Phase 17 added import_jobs and
+    # a test asserting it was empty, but not the matching cleanup, so that test
+    # passed only while the database happened to be empty -- and failed the
+    # first time anyone uploaded a file by hand. sorted_tables is dependency
+    # ordered, so reversing it deletes children before parents.
+    for table in reversed(Base.metadata.sorted_tables):
+        session.execute(delete(table))
     session.flush()
 
     try:
