@@ -6,6 +6,7 @@ from sqlalchemy.exc import DataError
 
 from app.core.exceptions import (
     DuplicateInvoiceError,
+    ImportFileError,
     InvoiceNotFoundError,
     InvoiceValidationError,
 )
@@ -52,6 +53,15 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def handle_invoice_validation(
         request: Request, exc: InvoiceValidationError
     ) -> JSONResponse:
+        return JSONResponse(status_code=422, content={"detail": exc.issues})
+
+    @app.exception_handler(ImportFileError)
+    async def handle_import_file(
+        request: Request, exc: ImportFileError
+    ) -> JSONResponse:
+        # 422 alongside InvoiceValidationError: a well-formed request whose
+        # content cannot be processed. The issues have the same shape, so a
+        # client parses one kind of error body, not two.
         return JSONResponse(status_code=422, content={"detail": exc.issues})
 
     @app.exception_handler(DataError)
