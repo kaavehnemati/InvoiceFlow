@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
+from app.core.exceptions import InvoiceNotFoundError
 from app.dependencies import InvoiceRepositoryDep, InvoiceServiceDep
 from app.schemas.invoice import InvoiceCreate, InvoiceRead
 
@@ -10,17 +11,12 @@ router = APIRouter(prefix="/invoices", tags=["invoices"])
 # an empty path produces exactly /invoices, while "/" would produce /invoices/
 # and make the old URL a redirect.
 #
-# The routes no longer build anything. They declare what they need and FastAPI
-# supplies it, which is why this module imports neither InvoiceService,
-# InvoiceRepository nor SessionLocal -- it does not need to know they exist.
+# These routes no longer decide what an error looks like. They raise domain
+# errors and let app/core/error_handlers.py map them to status codes, which is
+# why this module no longer imports HTTPException at all.
 @router.post("", response_model=InvoiceRead, status_code=201)
 def create_invoice(invoice: InvoiceCreate, service: InvoiceServiceDep):
-    created, issues = service.create(invoice)
-    # The service reports what is wrong; deciding that "wrong" means 422 is
-    # this layer's job, and the only thing this layer decides.
-    if issues:
-        raise HTTPException(status_code=422, detail=issues)
-    return created
+    return service.create(invoice)
 
 
 # Reads go straight to the repository. There is no business behavior to add, so
@@ -34,5 +30,5 @@ def list_invoices(repository: InvoiceRepositoryDep):
 def get_invoice(invoice_id: int, repository: InvoiceRepositoryDep):
     invoice = repository.get_by_id(invoice_id)
     if invoice is None:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+        raise InvoiceNotFoundError(invoice_id)
     return invoice

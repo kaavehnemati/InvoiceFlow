@@ -2,10 +2,10 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 11 — configuration. The three layers are wired by FastAPI, and
-every environment-specific value now comes from a validated settings object rather than from
-source. Errors are still raised as `HTTPException` from the router, and there is no logging
-yet. Each is addressed by a later
+**Current status:** Phase 12 — application exceptions. The three layers are wired by FastAPI,
+configuration comes from a validated settings object, and errors are raised as domain
+exceptions that a single translation layer turns into HTTP responses. There is no logging
+yet. That is addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -209,11 +209,20 @@ makes *sense*. An invoice that breaks any of them is refused with `422` and is n
 | `subtotal + tax == total` | `TOTAL_MISMATCH` |
 | `invoice_date <= today` (UTC) | `FUTURE_INVOICE_DATE` |
 | `currency in {EUR, USD, GBP}` | `INVALID_CURRENCY` |
-| `vendor + invoice_number` must not already exist | `DUPLICATE_INVOICE` |
 
-`DUPLICATE_INVOICE` currently returns `422` alongside the other rules. Phase 12 gives it its
-own `DuplicateInvoiceError` and promotes it to `409 Conflict`, which is the more accurate code
-for "this conflicts with something that already exists."
+### Duplicates are separate
+
+`vendor + invoice_number` must be unique, but that is not checked alongside the rules above.
+It is asked only of an invoice that already passes all of them, and it answers with **`409
+Conflict`**, not `422`:
+
+```json
+{"detail":[{"code":"DUPLICATE_INVOICE","field":"invoice_number","message":"..."}]}
+```
+
+The ordering is deliberate. A duplicate of a *malformed* invoice is not a conflict — the data
+is simply wrong — so `422` wins and the duplicate is never reported. Fix the data, resubmit,
+and then the `409` is the accurate answer.
 
 All rules are evaluated on every request, so one response reports everything that is wrong:
 
@@ -246,8 +255,14 @@ so a client tells them apart by which keys are present:
 | Schema (Pydantic) | `{"type", "loc", "msg", "input"}` |
 | Business rule | `{"code", "field", "message"}` |
 
-Both mean "well-formed JSON the server will not process." Unifying them, if it is ever worth
-doing, belongs to Phase 12, which owns exception-to-HTTP translation.
+Both mean "well-formed JSON the server will not process." They were left distinguishable
+rather than unified: the schema shape is FastAPI's own and changing it would mean overriding
+its validation handler, which buys less than it costs.
+
+An amount larger than the `invoices` table can store also lands here, as
+`AMOUNT_OUT_OF_RANGE`. That one comes from the database driver rather than from a business
+rule, and is translated in `app/core/error_handlers.py` — before this phase it escaped as a
+bare `500` with the cause visible only in the server log.
 
 ### Status codes
 
@@ -256,7 +271,8 @@ doing, belongs to Phase 12, which owns exception-to-HTTP translation.
 | `201 Created` | Invoice created |
 | `200 OK` | Invoice or list returned |
 | `404 Not Found` | No invoice with that ID |
-| `422 Unprocessable Entity` | Request failed schema validation |
+| `409 Conflict` | An invoice with that vendor and number already exists |
+| `422 Unprocessable Entity` | Request failed schema or business validation |
 
 ### Examples
 
@@ -335,7 +351,6 @@ playbook introduces each fix only once the problem is visible.
 | --- | --- | --- |
 | Duplicate detection is check-then-insert with no constraint underneath, so two *concurrent* requests can both pass the check and both write | see below | Phase 33 — idempotency |
 | Amounts with more than 2 decimal places are **silently rounded** by the database, which can break an invoice that passed validation | `POST` `subtotal:"0.005", tax:"0.005", total:"0.010"` → `201`, stored as `0.01 + 0.01 = 0.01` | unowned — see below |
-| A database error surfaces as a bare `500` | `POST` an amount above `9999999999.99` → `500 Internal Server Error` | Phase 12 — exception handling |
 | Nothing ever modifies an invoice, so `updated_at` always equals `created_at` | — | Phase 39 — review workflow |
 | An invoice is a header only; there are no line items, so the totals are asserted rather than derived | nothing sums to `subtotal` | Phase 15 — invoice items |
 
@@ -390,7 +405,9 @@ recorded here rather than fixed silently.
 │   ├── main.py              # FastAPI app; mounts the routers
 │   ├── dependencies.py      # get_db -> repository -> service
 │   ├── core/
-│   │   └── config.py        # Settings — the only reader of the environment
+│   │   ├── config.py        # Settings — the only reader of the environment
+│   │   ├── exceptions.py    # Domain errors; no status codes
+│   │   └── error_handlers.py # The only place mapping errors -> HTTP
 │   ├── db/
 │   │   ├── base.py          # Base — the declarative registry
 │   │   └── session.py       # DATABASE_URL, engine, SessionLocal

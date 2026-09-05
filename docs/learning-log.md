@@ -1534,3 +1534,150 @@ smaller lie than shipping a method nothing has ever run.
 4. Why is `.env` gitignored while `.env.example` is committed?
 5. How would you prove a configuration value actually reached the component it configures?
 6. Where do production secrets live if not in `.env`?
+
+---
+
+## Phase 12 — Application Exceptions and Error Handling
+
+### What I learned
+
+**A domain error and a status code are two different things.** `app/core/exceptions.py`
+contains three plain Python exceptions and mentions no HTTP anywhere:
+
+```python
+class DuplicateInvoiceError(InvoiceFlowError):
+    def __init__(self, vendor: str, invoice_number: str): ...
+```
+
+"This invoice already exists" is true whether it arrived over HTTP, from a spreadsheet, or
+out of a PDF. Only the HTTP case cares that the answer is `409`. That translation lives in
+exactly one file, `app/core/error_handlers.py`, and nowhere else in the application knows both
+halves.
+
+**Exceptions carry data, not rendered messages.** `InvoiceValidationError` holds the issue
+list; `DuplicateInvoiceError` holds the vendor and number. The HTTP layer builds a response
+body from them, a bulk importer could build a report row, and Phase 13 can log structured
+fields — all from the same object. A pre-formatted string would serve only the first.
+
+**The tuple is gone.** Phase 9 was forced into this signature:
+
+```python
+def create(self, data) -> tuple[Invoice | None, list[dict]]:
+```
+
+because the service could raise neither `HTTPException` (framework coupling) nor a domain
+exception (they did not exist). It now returns an `Invoice` and raises. The route became
+exactly the line the playbook sketched three phases ago:
+
+```python
+def create_invoice(invoice: InvoiceCreate, service: InvoiceServiceDep):
+    return service.create(invoice)
+```
+
+**The router stopped importing `HTTPException` entirely.** Verified by AST — its imported
+names are now `APIRouter`, the two dependency aliases, the two schemas, and
+`InvoiceNotFoundError`. The routes raise meaning; something else decides what meaning looks
+like.
+
+**Precedence between two error kinds had to be chosen deliberately.** An invoice can be both
+malformed and a duplicate, and only one status can come back:
+
+```text
+bad currency + duplicate  ->  422 [INVALID_CURRENCY]
+fix it, resubmit          ->  409 DUPLICATE_INVOICE
+```
+
+`422` wins because a duplicate of a malformed invoice is not a conflict — the data is simply
+wrong, and the duplicate question does not become meaningful until it is fixed. Implemented by
+moving the duplicate check out of `validate()` and into `create()`, after the rules.
+
+**A side effect worth having: `validate()` became pure.** Six rules, no database, no I/O,
+raises nothing. That is what Phase 20 will call on every spreadsheet row.
+
+**The `500` from Phase 6 is closed.**
+
+```text
+before:  POST subtotal 99999999999.00  ->  500, empty body, cause only in the log
+after:   POST subtotal 99999999999.00  ->  422 [AMOUNT_OUT_OF_RANGE]
+```
+
+`DataError` deliberately got no domain exception, because nothing in this codebase raises it —
+it comes from the driver. It is handled in `error_handlers.py` because that module is already
+the boundary between infrastructure and HTTP, which keeps SQLAlchemy out of both the service
+and the router.
+
+I also checked something the change could plausibly have broken: a `DataError` leaves its
+transaction failed, so the next request could inherit a poisoned session. It does not —
+overflow, then a valid create, then a list, all fine. Per-request sessions from Phase 10 are
+why.
+
+### Why this phase was needed
+
+The service had no way to say "this failed, and here is why" that did not either drag FastAPI
+into the business layer or make every caller remember to unpack a tuple. Meanwhile a duplicate
+was reported as `422` when it is a conflict, and a database error reached clients as nothing
+at all.
+
+### What problem existed before it
+
+`create()` returned `(invoice | None, issues)`. A caller writing
+`invoice = service.create(data)` got a tuple and no error. The router decided every status
+code inline. `DataError` escaped as an opaque `500`.
+
+### New concepts
+
+- Domain exceptions as distinct from transport errors
+- A single translation layer, registered with `app.exception_handler`
+- Exceptions carrying structured data rather than messages
+- Deliberate precedence between error categories
+- `409 Conflict` vs `422 Unprocessable Entity`
+- Handling a third-party exception at the boundary rather than wrapping it
+
+### Things I still do not fully understand
+
+- Schema `422`s and business `422`s still have different body shapes. Overriding FastAPI's
+  own validation handler would unify them — is that worth it, or is a client branching on
+  `type` vs `code` acceptable?
+- `InvoiceNotFoundError` is raised by the router, not the service, because reads bypass the
+  service. Is that inconsistent, or just honest about where the check happens?
+- There is no catch-all handler for genuinely unexpected exceptions. Should there be one that
+  returns a scrubbed `500` and logs the detail — and is that Phase 13's or Phase 44's job?
+- `DataError` is caught for amounts, but it covers other things too. Is `AMOUNT_OUT_OF_RANGE`
+  claiming more than it knows?
+
+### One architecture decision I can now explain
+
+**Why the service layer must not be coupled to FastAPI's `HTTPException`.**
+
+This phase answers the question Phase 9 could only pay for. Back then the service needed to
+report failure and had exactly two options: raise `HTTPException`, or return a tuple. It
+returned a tuple, and every caller has been unpacking it since.
+
+Raising `HTTPException` would have been shorter and would have read better. The cost is that
+"this invoice is invalid" and "the response status should be 422" become a single statement,
+and the second half is only true when there is a response. Three phases on the roadmap have no
+response: Phase 20 validates a thousand spreadsheet rows into a report; Phase 38 routes an
+uncertain OCR extraction to human review; Phase 14 asserts that a future-dated invoice is
+refused, without starting a server. A service that raises `HTTPException` serves none of them,
+and the workaround — catching a web framework's exception in code that has no web request — is
+worse than the tuple ever was.
+
+The evidence is now concrete rather than theoretical. The Definition of Done asked that
+service tests not depend on FastAPI HTTP exceptions, and the check ran every exception path —
+validation failure, duplicate, precedence between the two, and a successful create — with
+`sys.modules` containing **no `fastapi` module at all**, before or after.
+
+What makes this affordable is that the coupling has to live *somewhere*, and the honest answer
+is: in one file, at the edge. `error_handlers.py` knows about both domain errors and status
+codes because translating between them is its entire job. Every other module knows one side
+or the other. Swap HTTP for a queue consumer and exactly one file changes.
+
+### Interview questions I should be able to answer
+
+1. Why shouldn't a service layer raise `HTTPException`?
+2. Where should the mapping from a domain error to a status code live?
+3. What is the difference between `409` and `422`, and when does each apply?
+4. An invoice is both malformed and a duplicate. Which error do you return, and why?
+5. Why do these exceptions carry structured data instead of a formatted message?
+6. A third-party library raises an exception your code never throws. Where do you handle it?
+7. How would you prove that a service layer has no dependency on your web framework?
