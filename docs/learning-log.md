@@ -1681,3 +1681,155 @@ or the other. Swap HTTP for a queue consumer and exactly one file changes.
 5. Why do these exceptions carry structured data instead of a formatted message?
 6. A third-party library raises an exception your code never throws. Where do you handle it?
 7. How would you prove that a service layer has no dependency on your web framework?
+
+---
+
+## Phase 13 — Logging
+
+### What I learned
+
+**The application was silent.** Before this phase the only output was uvicorn's access log:
+
+```text
+INFO: 127.0.0.1 - "POST /invoices HTTP/1.1" 422 Unprocessable Entity
+```
+
+That records *that* something was refused, never *why*, *which invoice*, or *which vendor*.
+Counting application events in the log before the change: **zero**.
+
+**Four events, logged where they happen.**
+
+```text
+INFO  invoice_created     invoice_id=1 invoice_number=LOG-1 vendor=ABC GmbH
+INFO  invoice_rejected    invoice_number=LOG-2 vendor=ABC GmbH issue_codes=['INVALID_CURRENCY']
+INFO  duplicate_detected  invoice_number=LOG-1 vendor=ABC GmbH
+ERROR unexpected_error    path=/invoices method=GET exception_type=OperationalError
+```
+
+The first three come from the **service** because they are business facts, not HTTP facts —
+the same events will appear when Phase 20's importer processes a spreadsheet with no request
+involved. `unexpected_error` comes from an exception handler, because "a request blew up" is
+inherently a request-boundary fact.
+
+**Levels carry meaning, so they have to be chosen.** All three business events are `INFO`,
+including rejections. A client sending an invalid invoice and being told so is a normal
+outcome; logging it at `WARNING` would mean the level stops distinguishing anything.
+`unexpected_error` is `ERROR` because it is a bug or an outage.
+
+**`APP_ENV` finally does something.** It had been declared and unread since Phase 11 — the one
+loose thread that phase left. It now picks the formatter: readable lines locally, one JSON
+object per line everywhere else. And `LOG_LEVEL` does too — verified by running the same two
+requests at `INFO` and at `WARNING`:
+
+```text
+LOG_LEVEL=INFO     invoice_created=1  invoice_rejected=1
+LOG_LEVEL=WARNING  invoice_created=0  invoice_rejected=0
+```
+
+**Context goes in `extra={"context": {...}}`, not flat.** A flat `extra={"name": ...}` silently
+collides with `LogRecord`'s own attributes — `message`, `args`, `name`, `module` are all
+taken.
+
+**stdout, not a file.** A container writes to its output stream and lets the platform decide
+where that goes. Phase 29's Fargate tasks and Phase 44's CloudWatch both assume it.
+
+### Two risks I checked instead of assuming
+
+**Did the catch-all handler shadow the specific one?** Registering
+`@app.exception_handler(Exception)` could plausibly swallow `DataError` and silently regress
+Phase 12's `AMOUNT_OUT_OF_RANGE` back to a `500`. It does not — Starlette prefers the more
+specific handler, and the amount overflow still returns `422`.
+
+**Did clearing the root handlers break uvicorn's own logging?** No: startup lines present,
+and four POSTs produced exactly four access lines — no duplication, no silence.
+
+### Secrets, checked rather than claimed
+
+The demonstration ran with `DATABASE_URL` containing the password `s3cr3t-p4ssw0rd`, then the
+whole log was searched:
+
+```text
+s3cr3t-p4ssw0rd          occurrences: 0
+invoiceflow:invoiceflow  occurrences: 0
+postgresql+psycopg://    occurrences: 0
+```
+
+The same rule runs the other way. `unexpected_error` logs the full traceback and returns
+`{"detail": "Internal server error"}` — an exception message can name a table, a column or a
+connection string, and the person debugging has the log while the person who sent the request
+does not need it.
+
+### Why this phase was needed
+
+The gap had already bitten twice in this project. In Phase 10 every request started returning
+`500` and the cause — PostgreSQL had stopped — was only found by reading a raw traceback. In
+Phase 6 a `DataError` reached the client as an empty `500` with the reason recorded nowhere
+useful. Both are exactly what `unexpected_error` now captures; the demonstration for this
+phase was in fact a replay of the Phase 10 incident.
+
+### What problem existed before it
+
+No record of what the application did or why anything was refused. Debugging meant reproducing
+the problem locally, which does not work for something that happened in production an hour ago.
+
+### New concepts
+
+- Structured logging: events with fields rather than sentences
+- Formatter selection by environment
+- `extra=` and `LogRecord`'s reserved attribute names
+- Log levels as a decision about what deserves attention
+- Logging to stdout as a container contract
+- The asymmetry between what is logged and what is returned
+
+### Things I still do not fully understand
+
+- Nothing ties log lines from one request together. A `request_id` would — is that Phase 44's
+  job, or should it have been here?
+- `logger.exception` inside an async handler: is the traceback capture safe if another
+  exception is in flight?
+- Phase 20 will validate thousands of rows. One `invoice_rejected` line per bad row could be
+  tens of thousands of lines — does bulk work need a different logging strategy, or is that
+  what sampling is for?
+- The service now imports `logging`. That is stdlib rather than a framework, but it is still a
+  dependency on an ambient global. Is passing a logger in ever worth it?
+
+### One architecture decision I can now explain
+
+**Why logs are events with fields rather than sentences.**
+
+The natural thing to write is `logger.info(f"Rejected invoice {n} from {v}: bad currency")`.
+It reads perfectly. It is also nearly useless at scale, because the only way to get anything
+out of it is a regular expression over prose that some future edit will quietly break.
+
+What was written instead is an event name and a bag of fields. The name is a stable
+identifier — `invoice_rejected` means the same thing forever — and the fields are data, not
+grammar. That difference is what makes the log queryable rather than merely readable:
+
+```text
+event = "invoice_rejected"           how many rejections
+group by issue_codes                 which rule fires most
+vendor = "ABC GmbH"                  everything one vendor sent
+```
+
+None of those questions can be answered by grepping sentences, and all three are things
+someone actually asks when an import goes wrong.
+
+It also determines whether Phase 44 is easy or painful. That phase wants
+`invoice_validation_failures_total` as a metric — which, given events with a stable name and
+structured fields, is a counter over `event = "invoice_rejected"`. Given sentences, it is a
+second logging system bolted alongside the first.
+
+The general shape: **a log line has two audiences, and only one of them is human.** Optimising
+for the reader produces prose that no tool can use; optimising for the tool produces JSON that
+is unpleasant to read at a terminal. Letting `APP_ENV` pick the formatter serves both without
+either audience paying for the other — the same event, rendered for whoever is looking.
+
+### Interview questions I should be able to answer
+
+1. What is the difference between structured logging and just formatting a string?
+2. Why log business events from the service rather than from the route handler?
+3. Why is a validation failure `INFO` rather than `WARNING` or `ERROR`?
+4. Why should a container log to stdout instead of a file?
+5. What should never appear in a log, and what should never appear in a response?
+6. How would you turn these logs into the metrics Phase 44 asks for?
+7. Why does a catch-all `Exception` handler not break a more specific one?

@@ -1,9 +1,12 @@
+import logging
 from datetime import datetime, timezone
 
 from app.core.exceptions import DuplicateInvoiceError, InvoiceValidationError
 from app.models.invoice import Invoice
 from app.repositories.invoice_repository import InvoiceRepository
 from app.schemas.invoice import InvoiceCreate
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_CURRENCIES = {"EUR", "USD", "GBP"}
 
@@ -40,6 +43,20 @@ class InvoiceService:
         """
         issues = self.validate(data)
         if issues:
+            # INFO, not WARNING: a client sending something invalid and being
+            # told so is a normal outcome, not a symptom of trouble. Reserving
+            # the higher levels for things that need attention is what keeps
+            # them meaningful.
+            logger.info(
+                "invoice_rejected",
+                extra={
+                    "context": {
+                        "invoice_number": data.invoice_number,
+                        "vendor": data.vendor,
+                        "issue_codes": [i["code"] for i in issues],
+                    }
+                },
+            )
             raise InvoiceValidationError(issues)
 
         # Checked after the rules, not among them: a duplicate of a malformed
@@ -48,6 +65,15 @@ class InvoiceService:
         if self.repository.find_by_vendor_and_invoice_number(
             data.vendor, data.invoice_number
         ):
+            logger.info(
+                "duplicate_detected",
+                extra={
+                    "context": {
+                        "invoice_number": data.invoice_number,
+                        "vendor": data.vendor,
+                    }
+                },
+            )
             raise DuplicateInvoiceError(data.vendor, data.invoice_number)
 
         now = datetime.now(timezone.utc)
@@ -59,7 +85,18 @@ class InvoiceService:
             created_at=now,
             updated_at=now,
         )
-        return self.repository.create(invoice)
+        created = self.repository.create(invoice)
+        logger.info(
+            "invoice_created",
+            extra={
+                "context": {
+                    "invoice_id": created.id,
+                    "invoice_number": created.invoice_number,
+                    "vendor": created.vendor,
+                }
+            },
+        )
+        return created
 
     def validate(self, data: InvoiceCreate) -> list[dict]:
         """Check an invoice against the business rules.
