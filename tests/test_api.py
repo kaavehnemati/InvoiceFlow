@@ -112,6 +112,85 @@ def test_amount_out_of_range_is_422_not_500(client, invoice_payload):
     assert codes(response) == ["AMOUNT_OUT_OF_RANGE"]
 
 
+ITEM = {
+    "description": "Consulting",
+    "quantity": "2",
+    "unit_price": "100.00",
+    "tax_rate": "19",
+}
+
+
+def test_create_invoice_with_items(client, invoice_payload):
+    payload = invoice_payload(
+        invoice_number="API-ITEMS", subtotal="200.00", tax="38.00", total="238.00"
+    )
+    payload["items"] = [ITEM]
+
+    response = client.post("/invoices", json=payload)
+
+    assert response.status_code == 201
+    items = response.json()["items"]
+    assert len(items) == 1
+    # The three line amounts were derived by the server, not sent
+    assert items[0]["line_subtotal"] == "200.00"
+    assert items[0]["line_tax"] == "38.00"
+    assert items[0]["line_total"] == "238.00"
+
+
+def test_totals_must_agree_with_items(client, invoice_payload):
+    payload = invoice_payload(
+        invoice_number="API-MISMATCH", subtotal="999.00", tax="38.00", total="1037.00"
+    )
+    payload["items"] = [ITEM]
+
+    response = client.post("/invoices", json=payload)
+    assert response.status_code == 422
+    assert "LINE_TOTAL_MISMATCH" in codes(response)
+
+
+def test_item_rule_names_the_offending_line(client, invoice_payload):
+    payload = invoice_payload(
+        invoice_number="API-BADLINE", subtotal="0", tax="0", total="0"
+    )
+    payload["items"] = [ITEM, {**ITEM, "quantity": "0"}]
+
+    response = client.post("/invoices", json=payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert [d["field"] for d in detail] == ["items[1].quantity"]
+
+
+def test_client_cannot_supply_line_amounts(client, invoice_payload):
+    """line_* are server-assigned; sending them changes nothing."""
+    payload = invoice_payload(
+        invoice_number="API-FORGED", subtotal="200.00", tax="38.00", total="238.00"
+    )
+    payload["items"] = [{**ITEM, "line_subtotal": "1.00", "line_tax": "1.00",
+                         "line_total": "2.00"}]
+
+    response = client.post("/invoices", json=payload)
+    assert response.status_code == 201
+    assert response.json()["items"][0]["line_subtotal"] == "200.00"
+
+
+def test_header_only_invoice_returns_empty_items(client, invoice_payload):
+    response = client.post("/invoices", json=invoice_payload(invoice_number="API-BARE"))
+    assert response.status_code == 201
+    assert response.json()["items"] == []
+
+
+def test_items_are_returned_when_listing_and_fetching(client, invoice_payload):
+    payload = invoice_payload(
+        invoice_number="API-LIST-ITEMS", subtotal="200.00", tax="38.00", total="238.00"
+    )
+    payload["items"] = [ITEM]
+    invoice_id = client.post("/invoices", json=payload).json()["id"]
+
+    assert len(client.get(f"/invoices/{invoice_id}").json()["items"]) == 1
+    listed = {i["id"]: i for i in client.get("/invoices").json()}
+    assert len(listed[invoice_id]["items"]) == 1
+
+
 def test_amounts_sent_as_strings_keep_their_scale(client, invoice_payload):
     """Phase 3: a JSON number becomes a float first and loses scale."""
     response = client.post(
