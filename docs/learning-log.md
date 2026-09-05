@@ -1405,3 +1405,132 @@ interface for classes not yet written — which is the same mistake as writing
 5. Why is dependency injection not worth adding to a project on day one?
 6. When is the database session closed relative to response serialization, and why might that
    matter?
+
+---
+
+## Phase 11 — Configuration and Environment Variables
+
+### What I learned
+
+**Environment variables are how a process is told where it is running.** The same code has to
+work against a laptop's PostgreSQL, a staging database and a production one. The only thing
+that differs is a handful of values, and those values are supplied from outside the program.
+
+**A settings object gives configuration one home.** Before, the only configurable value was an
+`os.getenv` call buried in the module that builds the SQLAlchemy engine. Answering "what can
+this application be configured with" meant grepping. Now `app/core/config.py` is the single
+answer, and verified as such — there is no `os.getenv` or `os.environ` anywhere else in `app/`
+or `migrations/`.
+
+**Resolution order, confirmed by running it:**
+
+```text
+environment variable   >   .env   >   default in config.py
+```
+
+```text
+.env sets APP_ENV=production        -> app_env=production
+APP_ENV=staging on top of that      -> app_env=staging
+.env removed                        -> app_env=development
+```
+
+**Types make configuration fail early.** `Literal[...]` and `PostgresDsn` are not decoration:
+
+```text
+LOG_LEVEL=VERBOSE     -> log_level: Input should be 'DEBUG', 'INFO', 'WARNING', ...
+APP_ENV=prod          -> app_env: Input should be 'development', 'staging' or 'production'
+DATABASE_URL=not-a-url -> database_url: Input should be a valid URL
+```
+
+Each names the field and stops the process at import. Without that, `LOG_LEVEL=VERBOSE` would
+be accepted silently and simply never match anything — the kind of bug that is invisible until
+someone wonders why production has no debug logs.
+
+I checked `PostgresDsn` before relying on it, since a parsed-URL type can normalise what it
+round-trips. It returns the input byte-for-byte here, and rejects a wrong scheme
+(`mysql://...`). It does accept a URL with no database name, which is worth knowing.
+
+**Proving a setting actually reaches the thing it configures.** Printing `settings.database_url`
+only proves the settings object parsed it. The real test is whether the *engine* uses it:
+
+```text
+DATABASE_URL=...localhost:5432/does_not_exist
+-> FATAL: database "does_not_exist" does not exist
+```
+
+The failure names the configured database, so the value travelled the whole way. A config
+value that is read but never used looks identical to one that works.
+
+**A dependency that quietly disappeared.** `migrations/env.py` used to import `DATABASE_URL`
+*from the session module* — Alembic depended on the engine module purely to read a string. Both
+now read `app.core.config`, and neither imports the other.
+
+### Why this phase was needed
+
+Configuration was a single `getenv` with a hardcoded fallback, undiscoverable and unvalidated,
+sitting in a file whose job was something else entirely. Everything from Phase 23's containers
+onward assumes the same artifact runs in several environments, which only works if the
+differences between them live outside the code.
+
+### What problem existed before it
+
+No single place listing what could be configured. No validation. No `.env` support. And
+Alembic reaching into the session module for a string.
+
+### New concepts
+
+- Settings object as the single reader of the environment
+- `pydantic-settings`, `.env` files, and resolution precedence
+- Validating configuration at import time rather than at first use
+- `PostgresDsn` and `Literal` as configuration types
+- `.env.example` as the committed documentation of every knob
+
+### Things I still do not fully understand
+
+- `settings = Settings()` runs at import. That is what makes bad config fail fast, but it also
+  means importing anything from the app requires valid configuration. Does that ever get in
+  the way of tests?
+- `PostgresDsn` accepts a URL with no database name. Where would that surface?
+- Production credentials clearly should not sit in `.env` on a server. What actually replaces
+  it — Parameter Store, Secrets Manager, injected environment variables from the task
+  definition?
+- `SUPPORTED_CURRENCIES` is hardcoded in the service. It is a business rule today, but if it
+  ever varies per customer, does it become configuration or database rows?
+
+### One architecture decision I can now explain
+
+**Why configuration belongs in the environment rather than in source.**
+
+The tempting alternative is a `config_dev.py` and a `config_prod.py`, picking one at startup.
+It is easy to write and easy to read. It also means the artifact that runs in production is
+not the artifact that was tested in staging — the code differs, however slightly, and the
+difference is exactly the part nobody exercised until it mattered.
+
+Keeping configuration outside the code means one build runs everywhere. That becomes literal
+rather than philosophical from Phase 27 onward: a container image is pushed to ECR once and
+the *same digest* runs in dev and in production, differing only by the environment its task
+definition supplies. An image containing `config_prod.py` cannot be that image.
+
+The secrets argument follows from the same place. A credential in source is in the git
+history forever, visible to everyone with read access, and rotating it means a commit and a
+deploy. A credential in the environment is supplied at run time by something that can be
+audited and rotated independently. `.env` being gitignored while `.env.example` is committed
+splits those cleanly: the *names* of the settings are public documentation, the *values* are
+not.
+
+The honest limit: two of the three settings are declared but read by nothing. `.env.example`
+labels them as such. There is a real tension with the rule applied in Phase 8, where an
+uncalled repository method was left unwritten — the difference being that a config key with a
+default is a documented knob rather than an untested code path, and enumerating the knobs is
+what `.env.example` is *for*. Declaring the log level a phase before logging exists is a
+smaller lie than shipping a method nothing has ever run.
+
+### Interview questions I should be able to answer
+
+1. Why should configuration come from the environment instead of a settings module per
+   environment?
+2. What is the precedence between an environment variable, a `.env` file, and a default?
+3. Why validate configuration at startup rather than where it is used?
+4. Why is `.env` gitignored while `.env.example` is committed?
+5. How would you prove a configuration value actually reached the component it configures?
+6. Where do production secrets live if not in `.env`?

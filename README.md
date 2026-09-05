@@ -2,11 +2,10 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 10 — dependency injection. The three layers are in place and wired
-by FastAPI rather than by hand: routes handle HTTP, `InvoiceService` owns the business rules,
-`InvoiceRepository` owns persistence. Errors are still raised as `HTTPException` from the
-router, and configuration is still read straight from the environment. Each is addressed by a
-later
+**Current status:** Phase 11 — configuration. The three layers are wired by FastAPI, and
+every environment-specific value now comes from a validated settings object rather than from
+source. Errors are still raised as `HTTPException` from the router, and there is no logging
+yet. Each is addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -38,22 +37,8 @@ psql "postgresql://invoiceflow:invoiceflow@localhost:5432/invoiceflow" -c "selec
 
 ### Connection
 
-The connection string is read from the `DATABASE_URL` environment variable. If it is unset,
-the application falls back to the local development default:
-
-```text
-postgresql+psycopg://invoiceflow:invoiceflow@localhost:5432/invoiceflow
-```
-
-The `+psycopg` suffix selects the psycopg 3 driver. To point at a different database:
-
-```bash
-DATABASE_URL="postgresql+psycopg://user:pass@host:5432/dbname" uv run uvicorn app.main:app
-```
-
-`invoiceflow/invoiceflow` is a local development credential, not a secret, and no real
-credential belongs in source. Phase 11 replaces this single `os.getenv` call with a settings
-object and a `.env.example`.
+The connection string comes from the `DATABASE_URL` setting — see
+[Configuration](#configuration) below.
 
 ### Migrations
 
@@ -110,6 +95,46 @@ Never truncate `alembic_version`: that makes Alembic believe nothing was ever ap
 the tables are still there. If you need Alembic's record to match a schema that already
 exists, `alembic stamp head` sets the pointer without running any DDL.
 
+## Configuration
+
+Every setting lives in [app/core/config.py](app/core/config.py) and is documented in
+[.env.example](.env.example). Nothing else in the codebase reads the environment.
+
+| Setting | Default | Read by |
+| --- | --- | --- |
+| `DATABASE_URL` | `postgresql+psycopg://invoiceflow:invoiceflow@localhost:5432/invoiceflow` | the engine and Alembic |
+| `APP_ENV` | `development` | *nothing yet* |
+| `LOG_LEVEL` | `INFO` | *nothing yet — Phase 13* |
+
+Resolution order, first match wins:
+
+```text
+1. an environment variable
+2. a key in .env
+3. the default in app/core/config.py
+```
+
+So both of these work, and neither touches source:
+
+```bash
+DATABASE_URL="postgresql+psycopg://user:pass@host:5432/other" uv run uvicorn app.main:app
+
+cp .env.example .env    # then edit it; .env is gitignored
+```
+
+Settings are **validated at import time**, so a mistake stops the process immediately with a
+message naming the field:
+
+```bash
+LOG_LEVEL=VERBOSE uv run uvicorn app.main:app
+# log_level
+#   Input should be 'DEBUG', 'INFO', 'WARNING', 'ERROR' or 'CRITICAL'
+```
+
+`invoiceflow/invoiceflow` is a local development credential, not a secret. `.env` is
+gitignored precisely so it can hold real values locally without being committed; production
+credentials belong in a secret store, which Phase 41 and Phase 45 cover.
+
 ## Setup
 
 ```bash
@@ -145,8 +170,6 @@ With the server running:
 | `POST` | `/invoices` | Create an invoice |
 | `GET` | `/invoices` | List all invoices |
 | `GET` | `/invoices/{invoice_id}` | Fetch one invoice by ID |
-
-### Examples
 
 ### Schemas
 
@@ -366,6 +389,8 @@ recorded here rather than fixed silently.
 ├── app/
 │   ├── main.py              # FastAPI app; mounts the routers
 │   ├── dependencies.py      # get_db -> repository -> service
+│   ├── core/
+│   │   └── config.py        # Settings — the only reader of the environment
 │   ├── db/
 │   │   ├── base.py          # Base — the declarative registry
 │   │   └── session.py       # DATABASE_URL, engine, SessionLocal
@@ -383,6 +408,7 @@ recorded here rather than fixed silently.
 │   ├── env.py               # Alembic config; reads DATABASE_URL
 │   └── versions/            # One file per schema change
 ├── alembic.ini
+├── .env.example             # Every setting, with dev defaults
 ├── requirements.txt         # Pinned dependencies
 ├── docs/
 │   └── learning-log.md

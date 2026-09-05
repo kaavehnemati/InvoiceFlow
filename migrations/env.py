@@ -5,8 +5,8 @@ from sqlalchemy import pool
 
 from alembic import context
 
+from app.core.config import settings
 from app.db.base import Base
-from app.db.session import DATABASE_URL
 
 # Importing the model looks unused, and is not: it is what registers the
 # invoices table on Base.metadata, so --autogenerate has something to compare
@@ -25,7 +25,7 @@ if config.config_file_name is not None:
 # Take the connection string from the application's own configuration rather
 # than from alembic.ini, so there is one source of truth and no credential is
 # ever committed. The placeholder left in alembic.ini is never used.
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+config.set_main_option("sqlalchemy.url", str(settings.database_url))
 
 # What --autogenerate compares the live database against.
 target_metadata = Base.metadata
