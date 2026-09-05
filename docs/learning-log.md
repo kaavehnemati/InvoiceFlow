@@ -1987,3 +1987,162 @@ Which is also the argument for why this phase comes at 14 and not at 1. Tests wr
 5. What is `xfail(strict=True)` for, and why not just delete the test?
 6. How do you know whether your test suite is any good?
 7. Why is a rule that only tests rejection an incomplete test of that rule?
+
+---
+
+## Phase 15 — Invoice Items
+
+### What I learned
+
+**A one-to-many relationship, both halves.** `Invoice.items` and `InvoiceItem.invoice` with
+`back_populates`, `cascade="all, delete-orphan"` in the ORM, and `ondelete="CASCADE"` on the
+foreign key so the database agrees. Verified both ways: deleting through the session removed
+the items, and so did a raw `DELETE` in `psql` — zero orphans either way.
+
+**`lazy="selectin"` was a deliberate choice, not a default.** The default lazy load fires one
+query per invoice when the list endpoint serializes, and fails outright on an instance whose
+session has closed. `selectin` fetches every invoice's items in one extra query.
+
+**Two ambiguities in the spec had to be resolved before writing anything.**
+
+The playbook says `line_tax = line_subtotal × tax_rate`, and the rule next to it says
+`0 <= tax_rate <= 100`. Both cannot be true: if 19% is stored as `19`, multiplying directly
+gives tax a hundred times too large. The formula needs `/ 100`, and I wrote that in the
+function's docstring rather than silently diverging from the printed text.
+
+Whether line amounts are sent or derived is not stated at all — but Phase 16's Excel template
+settles it. A row has `item, quantity, unit_price, tax_rate` and no line columns, while the
+invoice has `declared_subtotal, declared_tax, declared_total`. **A later phase's data format
+answered a question this phase left open.**
+
+**Where you round decides whether the Definition of Done is true.**
+
+```text
+3 x 9.99      = 29.97
+19% of 29.97  = 5.6943   ->  5.69
+line_total    = 35.66
+```
+
+Rounding each line as it is computed means the stored lines sum *exactly* to the stored
+totals. Rounding only at the end would be marginally more accurate in aggregate and would
+produce an invoice whose own lines do not add up to it — the one thing this phase exists to
+prevent. Confirmed straight from the database:
+
+```text
+declared_subtotal 129.97 | lines_subtotal 129.97
+declared_tax       24.69 | lines_tax       24.69
+declared_total    154.66 | lines_total    154.66
+reconciles: t
+```
+
+**Optional means backward compatible, and that is testable.** Items were made optional, so
+the 48 tests written in Phase 14 had to pass **unmodified**. They did. `openapi.json` confirms
+it at the contract level: `InvoiceCreate` gained `items`, and its `required` list is
+unchanged.
+
+**Reporting the cause, not the effect.** If a line has `quantity = 0`, the sums are
+meaningless, so reconciliation is skipped and only `INVALID_QUANTITY` is reported. Otherwise
+one bad quantity would produce four issues, three of which are noise.
+
+### Two mistakes worth recording
+
+**1. I destroyed my own work with `git checkout --`.**
+
+The Phase 14 trick — break a file, run the suite, `git checkout --` to revert — worked because
+`app/` was identical to `HEAD` then. Here the service had uncommitted Phase 15 changes, so
+`git checkout` reverted to the Phase 14 version and silently deleted all of them. The suite
+still passed, which is what made it confusing: 77 tests green against a file that had lost its
+new code, because the tests I had written were in a different file that had not been touched
+yet.
+
+Redid it with `cp` to a backup instead. **A revert command reverts to a commit, not to
+"before what I just did"** — and the difference only bites when there is uncommitted work,
+which is exactly when it hurts most.
+
+**2. The break-testing found a second real hole, in the same class as Phase 14's.**
+
+```text
+BREAK 1  drop the /100        ->  12 tests failed
+BREAK 2  remove the quantize
+         from line_subtotal   ->   0 tests failed.  NOT CAUGHT.
+BREAK 3  skip reconciliation  ->   4 tests failed
+```
+
+Every test case I had written multiplied out to exactly two decimals — `2 × 100.00`,
+`3 × 9.99`, `2.5 × 80.00`. The rounding on `line_subtotal` was never exercised, so deleting it
+changed nothing. Added `1.555 × 3.00 = 4.665 → 4.67`, and break 2 then failed as it should.
+
+Phase 14's hole was testing rejection without acceptance. This one is testing an operation
+only with inputs that make it a no-op. Both are the same underlying mistake: **choosing test
+data that happens to be convenient rather than data that would notice.**
+
+### Why this phase was needed
+
+An invoice was a header with three amounts and nothing behind them. `subtotal`, `tax` and
+`total` were asserted by whoever sent them, and the only check was that they added up to each
+other. Nothing recorded what was bought, so nothing could contradict the header.
+
+### What problem existed before it
+
+Header-only invoices — a limitation recorded in the README since Phase 4 as *"the totals are
+asserted rather than derived."*
+
+### New concepts
+
+- One-to-many relationships, `back_populates`, cascade in both ORM and schema
+- Loading strategies (`selectin`) and why the default is a trap for collections
+- Derived values with a single definition shared by validation and persistence
+- Quantization and `ROUND_HALF_UP` as a domain decision, not a formatting one
+- Error paths that identify a collection element (`items[1].quantity`)
+- Suppressing downstream issues when an upstream one makes them meaningless
+
+### Things I still do not fully understand
+
+- `derive_line_amounts` is called twice per request — once by `validate()` and once by
+  `create()`. Cheap, but is computing-then-recomputing a smell, or the price of keeping
+  `validate()` pure?
+- The cascade means the invoice and its items commit together, which is what Phase 22 will
+  ask for. Is there anything left for that phase to do here, or does it only matter once
+  imports write many invoices?
+- Nothing can update or delete an item on an existing invoice. When Phase 39 adds approve and
+  reject, does editing lines come with it?
+- `sum(...)` over `Decimal` needs `Decimal("0")` as the start value or it begins at `int` 0.
+  It works, but is there a neater idiom?
+
+### One architecture decision I can now explain
+
+**Why derived values are computed in one place and stored anyway.**
+
+There is an obvious objection to storing `line_subtotal`, `line_tax` and `line_total`: they
+are `quantity × unit_price` and friends, so storing them duplicates information the row
+already contains. A normalized design would compute them on read.
+
+The reason not to is that an invoice is not a calculation, it is **a record of what was
+agreed**. If the tax rate changes next April and the amounts are recomputed on read, last
+year's invoices silently restate themselves — and the number the customer actually paid stops
+matching the number the system shows. The stored amount is evidence; the formula is only how
+the evidence was produced.
+
+The same logic explains why the *rounding* is stored rather than reapplied. `5.6943` rounds to
+`5.69` once, at the moment the invoice is created, and that is the figure that appears on the
+document. Recomputing it later with a different rounding mode, or summing unrounded values,
+would produce a different invoice from the one that was sent.
+
+What keeps the duplication honest is that the arithmetic exists exactly once.
+`derive_line_amounts()` is called by `validate()` to check the declared totals and by
+`create()` to build the rows. Two copies of that formula would eventually disagree, and the
+disagreement would appear as an invoice that fails its own validation.
+
+**Store the answer, define the question once.** The stored value is a fact about the past; the
+function is the rule for producing new ones. Conflating them is how systems quietly rewrite
+their own history.
+
+### Interview questions I should be able to answer
+
+1. Why store derived values instead of computing them on read?
+2. Where should rounding happen when lines sum to a total, and why does it matter?
+3. What does `lazy="selectin"` solve that the default does not?
+4. How do you make an ORM cascade and a database foreign key agree about deletes?
+5. Why report only `INVALID_QUANTITY` when the totals also fail to reconcile?
+6. Why is `git checkout --` the wrong way to undo an experiment on uncommitted work?
+7. A test suite passes when you delete a rounding call. What does that tell you?

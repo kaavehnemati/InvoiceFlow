@@ -4,6 +4,36 @@ from decimal import Decimal
 from pydantic import BaseModel, ConfigDict
 
 
+class InvoiceItemCreate(BaseModel):
+    """One line as a client may send it.
+
+    Note what is absent: line_subtotal, line_tax and line_total. Those are
+    derived by the server from quantity, unit_price and tax_rate, so a client
+    cannot assert them any more than it can assert an invoice's id.
+    """
+
+    description: str
+    quantity: Decimal
+    unit_price: Decimal
+    # A percentage: 19 means 19%, not 1900%.
+    tax_rate: Decimal
+
+
+class InvoiceItemRead(BaseModel):
+    """One line as the API returns it, with the derived amounts."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    description: str
+    quantity: Decimal
+    unit_price: Decimal
+    tax_rate: Decimal
+    line_subtotal: Decimal
+    line_tax: Decimal
+    line_total: Decimal
+
+
 class InvoiceCreate(BaseModel):
     """The shape of an invoice a client is allowed to send.
 
@@ -23,6 +53,9 @@ class InvoiceCreate(BaseModel):
     subtotal: Decimal
     tax: Decimal
     total: Decimal
+    # Optional: an invoice may still be header-only. When items are present the
+    # declared totals above must equal their sum.
+    items: list[InvoiceItemCreate] = []
 
 
 class InvoiceRead(BaseModel):
@@ -50,3 +83,4 @@ class InvoiceRead(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+    items: list[InvoiceItemRead] = []

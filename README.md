@@ -2,11 +2,11 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 14 — testing foundation. The three layers are wired by FastAPI,
-configuration comes from a validated settings object, errors are raised as domain exceptions
-that a single translation layer turns into HTTP responses, the application logs what it does,
-and 50 tests run in under a second. Invoices are still header-only, with no line items. That
-is addressed by a later
+**Current status:** Phase 15 — invoice items. Invoices now carry line items whose amounts are
+derived by the server, and the declared totals are checked against them. Behind that: three
+layers wired by FastAPI, a validated settings object, domain exceptions translated to HTTP in
+one place, structured logging, and 80 tests. There is no file import yet. That is addressed
+by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -145,7 +145,7 @@ uv run pytest
 One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 
 ```text
-48 passed, 2 xfailed in 0.35s
+78 passed, 2 xfailed in 0.85s
 ```
 
 | File | Category | Tests |
@@ -153,8 +153,9 @@ One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 | `test_validation.py` | unit — pure rules, no database | 15 |
 | `test_service.py` | service — rules plus duplicates | 8 |
 | `test_repository.py` | integration — real SQL | 7 |
-| `test_api.py` | API — `TestClient`, status codes | 14 |
+| `test_api.py` | API — `TestClient`, status codes | 20 |
 | `test_architecture.py` | the layering rules, as assertions | 5 |
+| `test_items.py` | line items — rules, derivation, storage | 24 |
 | `test_concurrency.py` | the duplicate race (`xfail`) | 1 |
 
 ### Your development data is safe
@@ -307,6 +308,7 @@ and a client can never supply.
 | `status` | string | `VALID` — an invoice is only stored if it passes every business rule |
 | `created_at` | datetime | UTC |
 | `updated_at` | datetime | UTC; equals `created_at` until something modifies the invoice |
+| `items` | array | Line items with their derived amounts; `[]` for a header-only invoice |
 
 ## Business rules
 
@@ -321,6 +323,55 @@ makes *sense*. An invoice that breaks any of them is refused with `422` and is n
 | `subtotal + tax == total` | `TOTAL_MISMATCH` |
 | `invoice_date <= today` (UTC) | `FUTURE_INVOICE_DATE` |
 | `currency in {EUR, USD, GBP}` | `INVALID_CURRENCY` |
+
+### Line items
+
+An invoice may carry line items. It does not have to — a header-only invoice is still valid,
+and asserts its own totals. But once it says what was bought, the header has to agree with
+the lines.
+
+Per item:
+
+| Rule | Issue code |
+| --- | --- |
+| `quantity > 0` | `INVALID_QUANTITY` |
+| `unit_price >= 0` | `NEGATIVE_AMOUNT` |
+| `0 <= tax_rate <= 100` | `INVALID_TAX_RATE` |
+
+Then, across the invoice:
+
+| Rule | Issue code |
+| --- | --- |
+| `sum(line_subtotal) == subtotal` | `LINE_TOTAL_MISMATCH` |
+| `sum(line_tax) == tax` | `TAX_MISMATCH` |
+| `sum(line_total) == total` | `LINE_TOTAL_MISMATCH` |
+
+Item issues name the offending line: `"field": "items[1].quantity"`.
+
+**The line amounts are derived, not sent.** A client supplies `description`, `quantity`,
+`unit_price` and `tax_rate`; the server computes the rest. Sending `line_subtotal` does
+nothing — it is a server-assigned field, like `id`.
+
+```text
+line_subtotal = quantity x unit_price
+line_tax      = line_subtotal x tax_rate / 100
+line_total    = line_subtotal + line_tax
+```
+
+`tax_rate` is a percentage: **19 means 19%**, not 1900%. (The playbook writes the tax rule
+without the `/ 100`, which cannot be meant literally given its own `0 <= tax_rate <= 100`
+bound.)
+
+Each amount is rounded to cents **as it is computed**, not at the end:
+
+```text
+3 x 9.99      = 29.97
+19% of 29.97  = 5.6943  ->  5.69
+line_total    = 35.66
+```
+
+That is what makes the totals checkable against the lines — the numbers stored are the numbers
+summed. Rounding only at the end would leave an invoice whose own lines do not add up to it.
 
 ### Duplicates are separate
 
@@ -464,7 +515,6 @@ playbook introduces each fix only once the problem is visible.
 | Duplicate detection is check-then-insert with no constraint underneath, so two *concurrent* requests can both pass the check and both write | see below | Phase 33 — idempotency |
 | Amounts with more than 2 decimal places are **silently rounded** by the database, which can break an invoice that passed validation | `POST` `subtotal:"0.005", tax:"0.005", total:"0.010"` → `201`, stored as `0.01 + 0.01 = 0.01` | unowned — see below |
 | Nothing ever modifies an invoice, so `updated_at` always equals `created_at` | — | Phase 39 — review workflow |
-| An invoice is a header only; there are no line items, so the totals are asserted rather than derived | nothing sums to `subtotal` | Phase 15 — invoice items |
 
 One thing worth knowing about the current validation: **unknown fields are ignored, not
 rejected.** `{"...": ..., "nonsense": true}` succeeds and `nonsense` is simply dropped. This
@@ -544,6 +594,7 @@ recorded here rather than fixed silently.
 │   ├── test_service.py      # Service — rules plus duplicates
 │   ├── test_repository.py   # Integration — real SQL
 │   ├── test_api.py          # API — TestClient, status codes
+│   ├── test_items.py        # Line items — rules, derivation, storage
 │   ├── test_architecture.py # The layering rules, as assertions
 │   └── test_concurrency.py  # The duplicate race (xfail)
 ├── pytest.ini
