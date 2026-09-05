@@ -2,10 +2,11 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 9 — service layer. The three layers are in place: routes handle
-HTTP, `InvoiceService` owns the business rules, `InvoiceRepository` owns persistence. Routes
-still wire their own collaborators by hand, and errors are still raised as
-`HTTPException` from the router. Each is addressed by a later
+**Current status:** Phase 10 — dependency injection. The three layers are in place and wired
+by FastAPI rather than by hand: routes handle HTTP, `InvoiceService` owns the business rules,
+`InvoiceRepository` owns persistence. Errors are still raised as `HTTPException` from the
+router, and configuration is still read straight from the environment. Each is addressed by a
+later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -364,6 +365,7 @@ recorded here rather than fixed silently.
 .
 ├── app/
 │   ├── main.py              # FastAPI app; mounts the routers
+│   ├── dependencies.py      # get_db -> repository -> service
 │   ├── db/
 │   │   ├── base.py          # Base — the declarative registry
 │   │   └── session.py       # DATABASE_URL, engine, SessionLocal
@@ -418,5 +420,36 @@ The price of that independence is visible in `InvoiceService.create()`, which re
 `(invoice, issues)` rather than raising: it cannot raise `HTTPException` without depending on
 the web framework. Phase 12 introduces domain exceptions and takes the tuple away.
 
-Note what is *still* not separated: routes open sessions and construct the service and
-repository by hand. Phase 10 replaces that with injected dependencies.
+### Wiring
+
+Routes do not build their collaborators. They declare what they need and FastAPI supplies it,
+resolving a chain defined once in [app/dependencies.py](app/dependencies.py):
+
+```text
+get_db()                  opens one session per request, closes it after the response
+  -> get_invoice_repository(session)
+       -> get_invoice_service(repository)
+```
+
+```python
+@router.get("", response_model=list[InvoiceRead])
+def list_invoices(repository: InvoiceRepositoryDep):
+    return repository.list_all()
+```
+
+`app/routers/invoices.py` imports neither `InvoiceService`, `InvoiceRepository` nor
+`SessionLocal` — it no longer needs to know those classes exist.
+
+Two things this buys. Overriding one dependency redirects everything below it, so a test can
+swap `get_db` for a test database without touching a route:
+
+```python
+app.dependency_overrides[get_invoice_service] = lambda: StubService()
+```
+
+And because the dependencies are declared with `Annotated` rather than as default values, the
+route functions stay ordinary callables:
+
+```python
+create_invoice(invoice=data, service=StubService())   # no app, no server, no database
+```

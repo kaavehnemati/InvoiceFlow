@@ -1261,3 +1261,147 @@ speaks HTTP — and the moment it does, everything that is not HTTP is locked ou
 5. Why is a duplicate check that passes 12 concurrent requests still not safe?
 6. How do you verify a phase that deliberately changes behavior?
 7. Why is `409` a better status for a duplicate than `422`?
+
+---
+
+## Phase 10 — Dependency Injection
+
+### What I learned
+
+**`Depends` inverts who does the building.** Before, each route constructed its own
+collaborators:
+
+```python
+with SessionLocal() as session:
+    service = InvoiceService(InvoiceRepository(session))
+```
+
+Now the route states a requirement and FastAPI satisfies it:
+
+```python
+def list_invoices(repository: InvoiceRepositoryDep):
+    return repository.list_all()
+```
+
+`app/routers/invoices.py` ended up importing neither `InvoiceService`, `InvoiceRepository` nor
+`SessionLocal`. Confirmed by parsing the module rather than reading it: the only functions it
+calls are `APIRouter` and `HTTPException`.
+
+**The dependency graph.** Each provider asks for the one above it instead of building it:
+
+```text
+get_db()  ->  get_invoice_repository(session)  ->  get_invoice_service(repository)
+```
+
+FastAPI resolves the chain per request, so every layer shares one session. The useful
+consequence is that overriding a dependency redirects everything beneath it — replacing
+`get_db` swaps the database for the repository and the service at once, without either
+knowing.
+
+**Session lifecycle, and why `yield` rather than `return`.** FastAPI runs the generator up to
+the `yield`, hands over the session, and resumes it once the response has been sent. Inspected
+directly:
+
+```text
+after next(gen):  session active = True
+after resuming:   generator finished -> the with block closed the session
+gen.throw(...):   exception propagates, and the session is still cleaned up
+```
+
+One session per request, closed exactly once, on both the success and failure paths.
+
+This is a real change from Phase 9, where each route closed its session *before* returning and
+serialization happened against a detached object. The session now stays open while the
+response is serialized. The behavior battery came back byte-identical, so nothing depended on
+the old ordering — but it could have, which is why it was worth diffing rather than assuming.
+
+**Testability — the payoff, and why `Annotated` matters for it.** With
+`Annotated[X, Depends(f)]` the parameter has no default, so the route is a plain function:
+
+```text
+create_invoice(invoice=data, service=StubService())  -> HTTPException 422 ['STUB']
+get_invoice(invoice_id=999, repository=StubRepo())   -> HTTPException 404
+list_invoices(repository=StubRepo())                 -> ['a', 'b']
+```
+
+No app, no server, no database. And through FastAPI, the same substitution:
+
+```text
+app.dependency_overrides[get_invoice_service] = lambda: StubService()
+POST /invoices -> 422, detail codes ['OVERRIDDEN']
+```
+
+The real service and the database were never reached. That is the mechanism Phase 14's test
+suite will be built on.
+
+### Why this phase was needed
+
+The construction `InvoiceService(InvoiceRepository(session))` appeared in every route that
+needed it, and the session lifecycle was restated three times. Both are the kind of detail
+that is eventually wrong in exactly one place.
+
+### What problem existed before it
+
+Routes were welded to concrete classes. Nothing could be substituted, so testing a route meant
+having a real database, and changing how a service is built meant editing every route.
+
+### New concepts
+
+- `Depends`, and dependencies that depend on dependencies
+- `Annotated[X, Depends(f)]` versus the default-value form
+- Generator dependencies and per-request resource lifecycles
+- `dependency_overrides` as the seam for tests
+- Verifying a claim about a module by parsing it rather than grepping it
+
+### Things I still do not fully understand
+
+- Dependencies are resolved per request. Is `InvoiceService` constructed on every single
+  request, and does that ever matter?
+- `get_db` yields inside a `with`. What happens if the response itself fails to serialize —
+  after the yield but before the generator resumes?
+- Overriding `get_db` should redirect everything below it. Does that hold when a dependency
+  is cached within a request, and what is `use_cache` for?
+
+### A note on tooling, not code
+
+PostgreSQL stopped partway through this phase — a WSL restart, most likely — and every request
+started returning `500`. The traceback said `connection refused`, not anything about the
+application. Worth recording because the symptom (`500` on a route that worked minutes
+earlier) looks exactly like a regression, and the log was the only thing that distinguished
+the two. It is also a preview of Phase 12: an unhandled infrastructure failure surfacing as an
+opaque 500 with the real cause visible only server-side.
+
+### One architecture decision I can now explain
+
+**Why injection is worth it now, and would have been ceremony in Phase 2.**
+
+The same three files could have been written on day one. FastAPI supports it, tutorials show
+it, and it would have looked more professional. It would also have been pure overhead, because
+in Phase 2 there was nothing to inject — no database, no repository, no service. A `get_db`
+dependency in a project whose storage is a Python list is a mechanism with no purpose,
+justified only by the belief that it will have one later.
+
+What makes it worth its cost now is that there is finally something worth substituting.
+Between Phase 6 and Phase 9 the project acquired a session with a lifecycle, a repository that
+talks to real PostgreSQL, and a service holding rules worth testing in isolation. Injection is
+valuable in proportion to how much you want to vary what gets injected, and that quantity was
+zero until very recently.
+
+The general shape: **indirection buys optionality, and optionality is only worth its cost when
+you can name the option.** Here the options are concrete — a test database instead of the real
+one, a stub service instead of the real one, and in Phase 14 both at once.
+
+It also explains the ordering. Injection had to come after the service and repository existed,
+because injecting them requires them to exist. Doing it earlier would have meant designing an
+interface for classes not yet written — which is the same mistake as writing
+`find_by_vendor_and_invoice_number` before anything called it.
+
+### Interview questions I should be able to answer
+
+1. What does `Depends` actually do, and when does FastAPI resolve it?
+2. Why does `get_db` use `yield` instead of `return`?
+3. What is the difference between `Annotated[X, Depends(f)]` and `x: X = Depends(f)`?
+4. How would you point your tests at a different database without editing any route?
+5. Why is dependency injection not worth adding to a project on day one?
+6. When is the database session closed relative to response serialization, and why might that
+   matter?
