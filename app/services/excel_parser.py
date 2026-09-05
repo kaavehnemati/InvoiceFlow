@@ -54,12 +54,20 @@ class RowError:
 
     row_number is the number Excel shows in its own gutter, so an error about
     "row 4" points at the line the user is looking at.
+
+    invoice_number and vendor are best-effort: a row that fails on an
+    unreadable quantity usually has perfectly readable identity cells. They are
+    empty only when those cells are themselves unreadable. Phase 19 needs them
+    to work out which invoice a failed row belonged to -- an invoice missing one
+    of its lines has to be rejected whole, not built from the survivors.
     """
 
     row_number: int
     field: str
     code: str
     message: str
+    invoice_number: str = ""
+    vendor: str = ""
 
 
 def _to_text(value) -> str:
@@ -139,8 +147,22 @@ def parse_rows(content: bytes) -> tuple[list[ParsedRow], list[RowError]]:
 
         row_errors: list[RowError] = []
 
+        # Read the identity cells first, so every error from this row can say
+        # which invoice it belonged to even when other cells are unreadable.
+        identity_number = _to_text(cell("invoice_number"))
+        identity_vendor = _to_text(cell("vendor"))
+
         def fail(field: str, code: str, message: str) -> None:
-            row_errors.append(RowError(row_number, field, code, message))
+            row_errors.append(
+                RowError(
+                    row_number=row_number,
+                    field=field,
+                    code=code,
+                    message=message,
+                    invoice_number=identity_number,
+                    vendor=identity_vendor,
+                )
+            )
 
         values: dict = {}
 

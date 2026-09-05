@@ -2,11 +2,11 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 18 — row parsing. Uploaded spreadsheets can be turned into typed
-data, though the parser is not yet wired into the endpoint. Behind it: upload with structural
+**Current status:** Phase 19 — grouping. Spreadsheet rows can be parsed and grouped back into
+invoices, though none of it is wired into the endpoint yet. Behind it: upload with structural
 checks, the published import contract, invoices with line items whose amounts are derived and
 reconciled, three layers wired by FastAPI, a validated settings object, domain exceptions
-translated to HTTP in one place, structured logging, and 131 tests. That is addressed by a
+translated to HTTP in one place, structured logging, and 154 tests. That is addressed by a
 later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
@@ -307,6 +307,58 @@ still match the sheet, so an error about "row 5" is the fifth row on screen.
 **Columns are found by name, not position.** Reorder the columns and it still works — reading
 by index would quietly put the vendor into the date field.
 
+## Grouping rows into invoices
+
+A spreadsheet does not contain rows, it contains invoices. One invoice with three lines takes
+three rows, repeating its invoice-level columns on each.
+[app/services/excel_grouper.py](app/services/excel_grouper.py) turns that repetition back into
+a single thing.
+
+```text
+9 rows in            ->  2 invoices built from 5 lines, 2 flagged
+
+INV-1001  ABC GmbH  2026-01-15  EUR  rows [2, 3, 4]
+    row 2  Consulting   2 x 100 @19%
+    row 3  Travel       1 x 50  @19%
+    row 4  Materials    1 x 25  @19%
+```
+
+Rows are grouped by **`vendor + invoice_number`, compared exactly** — the same rule Phase 9's
+duplicate check uses. Normalising differently here would mean the two disagree about what
+counts as the same invoice.
+
+### Cross-row consistency
+
+Five columns describe the invoice rather than the line, and repeat on every row:
+`invoice_date`, `currency`, `declared_subtotal`, `declared_tax`, `declared_total`. Every row of
+an invoice must agree about all five.
+
+| Situation | Code |
+| --- | --- |
+| Rows of one invoice disagree about an invoice-level field | `INCONSISTENT_INVOICE_FIELD` |
+| One of an invoice's rows could not be parsed | `INCOMPLETE_INVOICE` |
+
+```text
+Invoice INV-3003 -> INCONSISTENT_INVOICE_FIELD
+    rows of this invoice disagree about currency: row 7 says EUR; row 8 says USD
+
+Invoice INV-4004 -> INCOMPLETE_INVOICE
+    row(s) 10 could not be read, so this invoice is missing at least one line item
+```
+
+Two deliberate choices:
+
+**No value wins a disagreement.** There is no first-row-wins or majority rule. The invoice is
+rejected and every conflicting value is named with the row that claimed it.
+
+**An invoice missing any line is rejected whole**, not built from the rows that survived.
+Otherwise the error surfaces later as *"subtotal is 250.00 but lines sum to 200.00"*, sending
+someone to hunt an arithmetic mistake when the cause is one unreadable cell — and they could
+"fix" it by editing the totals, silently importing an invoice with a line missing.
+
+Errors here name an **invoice**; parser errors name a **row**. Phase 21's report keeps that
+distinction.
+
 ## Testing
 
 ```bash
@@ -316,7 +368,7 @@ uv run pytest
 One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 
 ```text
-129 passed, 2 xfailed in 1.8s
+152 passed, 2 xfailed in 1.8s
 ```
 
 | File | Category | Tests |
@@ -330,6 +382,7 @@ One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 | `test_template.py` | the import contract | 12 |
 | `test_imports.py` | upload and structural validation | 17 |
 | `test_parser.py` | row parsing and normalisation | 22 |
+| `test_grouper.py` | grouping and cross-row consistency | 23 |
 | `test_concurrency.py` | the duplicate race (`xfail`) | 1 |
 
 ### Your development data is safe
@@ -770,6 +823,7 @@ recorded here rather than fixed silently.
 │       ├── invoice_service.py      # Business rules and invoice creation
 │       ├── import_service.py       # Structural validation of uploads
 │       ├── excel_parser.py         # Cells -> typed rows, or row errors
+│       ├── excel_grouper.py        # Rows -> invoices, or invoice errors
 │       └── excel_template.py       # The import contract, and the .xlsx builder
 ├── migrations/
 │   ├── env.py               # Alembic config; reads DATABASE_URL
@@ -785,6 +839,7 @@ recorded here rather than fixed silently.
 │   ├── test_template.py     # The import contract
 │   ├── test_imports.py      # Upload and structural validation
 │   ├── test_parser.py       # Cells -> typed rows
+│   ├── test_grouper.py      # Rows -> invoices
 │   ├── test_architecture.py # The layering rules, as assertions
 │   └── test_concurrency.py  # The duplicate race (xfail)
 ├── pytest.ini
