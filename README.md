@@ -2,11 +2,12 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 17 — Excel upload. Files can be uploaded and checked for
-structure, producing an `ImportJob`. Nothing reads the rows yet. Behind it: the published
-import contract, invoices with line items whose amounts are derived and reconciled, three
-layers wired by FastAPI, a validated settings object, domain exceptions translated to HTTP in
-one place, structured logging, and 109 tests. That is addressed by a later
+**Current status:** Phase 18 — row parsing. Uploaded spreadsheets can be turned into typed
+data, though the parser is not yet wired into the endpoint. Behind it: upload with structural
+checks, the published import contract, invoices with line items whose amounts are derived and
+reconciled, three layers wired by FastAPI, a validated settings object, domain exceptions
+translated to HTTP in one place, structured logging, and 131 tests. That is addressed by a
+later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -253,6 +254,59 @@ a real inconsistency, chosen deliberately: an import id travels through URLs, lo
 conversations, where `imp_78fe620d94f6` is unambiguous about what it refers to and needs no
 parsing at the boundary. Invoice ids never left the database's control.
 
+## Row parsing
+
+A cell is not a value. Excel hands back a float where you wanted a decimal, a `datetime` where
+you wanted a date, and a string with a trailing space nobody can see.
+[app/services/excel_parser.py](app/services/excel_parser.py) is the boundary where that
+becomes typed data — nothing downstream has to think about cells again.
+
+> **Not wired into `POST /imports` yet.** Phase 19 groups the parsed rows into invoices and
+> Phase 20 persists them. Today the parser exists and is tested; the endpoint is unchanged.
+
+### Normalisation
+
+| Cell contains | Becomes | |
+| --- | --- | --- |
+| `"  ABC GmbH  "` | `"ABC GmbH"` | whitespace stripped everywhere |
+| `"  eur "` | `"EUR"` | the business rule is case-sensitive on purpose; this is where casing is fixed |
+| `datetime(2026,1,15)` | `date(2026,1,15)` | a date-formatted cell |
+| `"2026-01-15"` | `date(2026,1,15)` | a text cell |
+| `0.1` (float) | `Decimal("0.1")` | via `str()` — `Decimal(0.1)` is `0.1000000000000000055…` |
+
+### Row errors
+
+| Situation | Code |
+| --- | --- |
+| A required cell is empty | `MISSING_REQUIRED_FIELD` |
+| Not a date cell and not `YYYY-MM-DD` | `INVALID_DATE` |
+| Not a number | `INVALID_NUMBER` |
+
+Every non-blank row produces **exactly one** outcome — a typed row, or one or more errors,
+never both. A row with three bad cells reports all three, so nobody has to resubmit to find
+the next problem.
+
+```text
+row 2  PARSED   INV-001 | 'ABC GmbH' | 2026-01-15 | qty=2 | 'EUR'
+row 4  (blank, skipped)
+row 5  ERRORS
+         INVALID_DATE      invoice_date  '15/01/2026' is not a date. Use YYYY-MM-DD.
+         INVALID_NUMBER    quantity      'two' is not a number
+```
+
+Three deliberate choices:
+
+**Ambiguous dates are refused.** `01/02/2026` is 2 January or 1 February depending on who
+typed it. An invoice silently dated five weeks wrong is worse than one rejected, so only real
+date cells and `YYYY-MM-DD` are accepted.
+
+**Blank rows are skipped.** Excel keeps rows whose contents were deleted; a file with three
+invoices and nine hundred leftovers should not produce nine hundred complaints. Row numbers
+still match the sheet, so an error about "row 5" is the fifth row on screen.
+
+**Columns are found by name, not position.** Reorder the columns and it still works — reading
+by index would quietly put the vendor into the date field.
+
 ## Testing
 
 ```bash
@@ -262,7 +316,7 @@ uv run pytest
 One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 
 ```text
-107 passed, 2 xfailed in 0.80s
+129 passed, 2 xfailed in 1.8s
 ```
 
 | File | Category | Tests |
@@ -275,6 +329,7 @@ One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 | `test_items.py` | line items — rules, derivation, storage | 24 |
 | `test_template.py` | the import contract | 12 |
 | `test_imports.py` | upload and structural validation | 17 |
+| `test_parser.py` | row parsing and normalisation | 22 |
 | `test_concurrency.py` | the duplicate race (`xfail`) | 1 |
 
 ### Your development data is safe
@@ -714,6 +769,7 @@ recorded here rather than fixed silently.
 │   └── services/
 │       ├── invoice_service.py      # Business rules and invoice creation
 │       ├── import_service.py       # Structural validation of uploads
+│       ├── excel_parser.py         # Cells -> typed rows, or row errors
 │       └── excel_template.py       # The import contract, and the .xlsx builder
 ├── migrations/
 │   ├── env.py               # Alembic config; reads DATABASE_URL
@@ -728,6 +784,7 @@ recorded here rather than fixed silently.
 │   ├── test_items.py        # Line items — rules, derivation, storage
 │   ├── test_template.py     # The import contract
 │   ├── test_imports.py      # Upload and structural validation
+│   ├── test_parser.py       # Cells -> typed rows
 │   ├── test_architecture.py # The layering rules, as assertions
 │   └── test_concurrency.py  # The duplicate race (xfail)
 ├── pytest.ini

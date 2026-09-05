@@ -2385,3 +2385,137 @@ else.**
 4. How would you guarantee the template you publish is one your importer accepts?
 5. When is a prefixed string id better than an integer, and what does it cost?
 6. Why does the template version only affect the error message, not acceptance?
+
+---
+
+## Phase 18 — Excel Row Parsing
+
+### What I learned
+
+**A cell is not a value.** Excel hands back a `float` where the user typed a decimal, a
+`datetime` where they typed a date, and a string with a trailing space nobody can see. The
+parser is the one place that deals with all of it, so nothing downstream ever has to.
+
+**Normalisation is a list of small betrayals, each of which would otherwise reach the
+database:**
+
+```text
+"  ABC GmbH  "        -> "ABC GmbH"
+"  eur "              -> "EUR"
+datetime(2026,1,15)   -> date(2026,1,15)
+0.1  (float)          -> Decimal("0.1")
+```
+
+That last one matters more than it looks. `Decimal(0.1)` is
+`0.1000000000000000055511151231257827` — the binary float's true value. Going through `str()`
+first keeps what the user typed. Phase 2 chose `Decimal` to avoid exactly this, and reading
+cells is where it could have crept back in.
+
+**The currency line is a payoff two phases in the making.** Phase 4 made the currency rule
+case-sensitive and its test says *"normalising input casing is Phase 18's job"*. This is that
+job: `"  eur "` becomes `"EUR"` before any rule sees it.
+
+**Every non-blank row gets exactly one outcome** — a `ParsedRow` or one-or-more `RowError`,
+never both, never neither. A row with three unreadable cells reports all three, the same
+"everything at once" rule Phase 4 set, for the same reason: nobody should have to resubmit a
+spreadsheet to discover its next problem.
+
+**Columns are located by header name, not position.** Reading by index is the obvious
+implementation and it silently misfiles every value the moment someone reorders a column —
+vendor into the date field, quantity into the currency. The test that reverses the entire
+header row is what pins it.
+
+### A test that passed for the wrong reason
+
+The suite was red when this phase started, and the cause was mine. Phase 17 added the
+`import_jobs` table and a test asserting it was empty, but never extended the fixture that
+clears tables before each test:
+
+```python
+session.execute(delete(Invoice))     # and nothing else
+```
+
+So `test_rejected_upload_creates_no_job` passed only while the database happened to be empty.
+Phase 17's "suite green" check passed by luck, and the first manual upload afterwards broke it.
+
+The fix is generic rather than one more line, so the next new table cannot repeat it:
+
+```python
+for table in reversed(Base.metadata.sorted_tables):
+    session.execute(delete(table))
+```
+
+`sorted_tables` is dependency-ordered, so reversing it deletes children before parents —
+`invoice_items` before `invoices` — with no list for anyone to forget. Verified by seeding
+committed rows into all three tables, running the suite green, and confirming the seeded rows
+survived the rollback.
+
+**The lesson is not "remember to update the fixture".** It is that a green suite proves less
+than it appears to when a test depends on ambient state. That test never asserted what I
+thought it did; it asserted "the database is empty" and got the right answer for the wrong
+reason.
+
+### Why this phase was needed
+
+Phase 17 could tell that a file was a readable workbook with the right columns. Nothing had
+ever looked at a cell. Every later phase — grouping, validating, persisting — needs typed
+values, and something has to be the place where strings and floats stop being strings and
+floats.
+
+### What problem existed before it
+
+Uploaded files were checked and discarded. Their contents were unreachable.
+
+### New concepts
+
+- Parsing as a boundary: untyped input in, typed data or structured errors out
+- `Decimal(str(x))` versus `Decimal(x)` for floats
+- Excel's `datetime` for date cells, and text for everything else
+- Header-name column mapping
+- Blank-row handling as a real design decision, not an oversight
+- Frozen dataclasses as parse results
+
+### Things I still do not fully understand
+
+- `parse_rows` loads the whole workbook into memory. `read_only=True` streams, at the cost of
+  a narrower API — at what file size does that become necessary?
+- A cell formatted as text but containing `2026-01-15` works; one formatted as a date but
+  displaying `15/01/2026` gives a `datetime` and also works. Are there formats where Excel
+  hands back something that looks fine and is not?
+- Errors carry a `field` name matching the spreadsheet column (`item`), but the API's schema
+  calls it `description`. Which vocabulary should Phase 21's error report speak?
+
+### One architecture decision I can now explain
+
+**Why the parser refuses dates it could plausibly interpret.**
+
+`15/01/2026` is unambiguous to a European reader — 15 January, because there is no fifteenth
+month. Accepting it would cost three lines and make the importer friendlier for exactly the
+spreadsheets most likely to arrive. I rejected it anyway.
+
+The reason is the case one step over. `01/02/2026` is 2 January or 1 February depending on
+where the file was typed, and both readings are valid dates, so nothing downstream can detect
+the mistake. A rejected file produces a complaint and a correction. A misread date produces an
+invoice that is silently five weeks wrong, in a system whose whole purpose is being right about
+invoices — and it will be found, if ever, by an accountant reconciling a quarter.
+
+Supporting `DD/MM/YYYY` while refusing `MM/DD/YYYY` is not an option either: they are the same
+string. The choice is between accepting a whole ambiguous family or none of it.
+
+So the parser accepts what Excel gives for a real date cell — which carries no ambiguity,
+because it is a number, not text — and `YYYY-MM-DD`, which the template specifies and its
+Instructions sheet demonstrates. Everything else is `INVALID_DATE` with a message naming the
+expected format.
+
+**A parser's job is to refuse what it cannot interpret unambiguously.** Being lenient about
+input is a virtue when the cost of a wrong guess is an error; it is a defect when the cost is
+a plausible-looking wrong answer.
+
+### Interview questions I should be able to answer
+
+1. Why is `Decimal(0.1)` wrong and `Decimal(str(0.1))` right?
+2. Why find spreadsheet columns by name rather than by position?
+3. Should an import parser accept `01/02/2026`? Defend the answer.
+4. Why skip blank rows instead of reporting them?
+5. A test passes. What would have to be true for it to be passing for the wrong reason?
+6. Where should whitespace and casing be normalised, and why not in the business rules?
