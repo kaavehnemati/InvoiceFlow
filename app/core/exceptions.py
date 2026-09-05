@@ -33,3 +33,14 @@ class InvoiceValidationError(InvoiceFlowError):
     def __init__(self, issues: list[dict]):
         self.issues = issues
         super().__init__(f"{len(issues)} validation issue(s)")
+
+
+class ImportFileError(InvoiceFlowError):
+    """The uploaded file is not a usable import workbook.
+
+    Structural, not business: this says nothing about the invoices inside.
+    """
+
+    def __init__(self, issues: list[dict]):
+        self.issues = issues
+        super().__init__(f"{len(issues)} structural issue(s)")

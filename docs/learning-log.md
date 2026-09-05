@@ -2270,3 +2270,118 @@ filename is metadata the environment can strip; a cell travels with the file.
 4. Why should a test compare a contract to literals rather than to the constant defining it?
 5. Where should a file format's version live, and why is the filename not enough?
 6. Why keep the worked example off the sheet the user types into?
+
+---
+
+## Phase 17 — Excel Upload and Structural Validation
+
+### What I learned
+
+**Multipart file upload.** `UploadFile` in the signature is the whole integration; FastAPI
+handles the multipart parsing. It needs `python-multipart` installed or the route refuses to
+start — a framework requirement, not a choice. This is also the first route in the project
+that is genuinely `async`, because `UploadFile.read()` is awaitable.
+
+**The contract loop closed.** Phase 16 published a column list; this phase validates against
+the same constant:
+
+```python
+from app.services.excel_template import COLUMN_NAMES, SHEET_NAME
+```
+
+The most valuable test in the phase downloads the template, fills it in, and uploads it. If
+the file we hand out were ever not accepted by the validator, that fails. Verified over real
+HTTP too — download, add two rows with openpyxl, `curl -F` it back, `201`.
+
+**These checks stop at the first failure, unlike business rules.** Phase 4 deliberately
+reported every broken rule at once so a client learns everything in one round trip. Here the
+checks are sequentially dependent — there is nothing to say about the columns of a file that
+is not a workbook — so they short-circuit. **Whether to accumulate errors depends on whether
+they are independent**, not on a house style.
+
+**openpyxl raises whatever it feels like** for a file that is not a workbook: `BadZipFile`,
+`KeyError`, `ValueError`. Catching broadly is right here, because the distinction is of no use
+to whoever uploaded it — they need "this is not a spreadsheet", not a Python type name.
+
+**The version hint only fires where it helps.**
+
+```text
+missing required column(s): vendor. This file was made from template v0;
+the current template is v1.
+```
+
+A file whose columns are correct imports whatever version it claims, including none — a
+hand-built workbook has no version cell and is perfectly valid. Mentioning the version then
+would be noise. It earns its place only when something else has already failed and it explains
+why.
+
+**A prefixed string id.** `imp_78fe620d94f6` is the same value in the database, the API, a log
+line and a support ticket. The alternative — integer key, `imp_{id}` on the way out — needs
+parsing on the way back in, and then a decision about whether `imp_abc` and plain `12` are
+errors. The cost is real: this codebase now has two id styles, and the README says so rather
+than hiding it.
+
+### Why this phase was needed
+
+Phase 16 published a template and there was nothing to send it to. A user could download the
+contract, fill in 300 rows, and then had no way to hand it back.
+
+### What problem existed before it
+
+Invoices could only arrive one at a time as JSON. No file could enter the system.
+
+### New concepts
+
+- `UploadFile`, multipart forms, `python-multipart`
+- Reading a workbook from bytes rather than a path (`BytesIO`)
+- Short-circuiting versus accumulating validation, and when each is right
+- Prefixed string identifiers as public handles
+- A model that starts with four of its eventual eleven columns
+
+### Things I still do not fully understand
+
+- The file is read into memory whole. At what size does that stop being acceptable, and is
+  streaming to disk the answer, or a size limit before the read?
+- `openpyxl` in `read_only=True` mode is much cheaper for large files but exposes a narrower
+  API. Should the structural check use it and only open fully once parsing starts?
+- The extension check trusts the filename. Should the first bytes be checked for a zip magic
+  number instead, given that is what `UNREADABLE_WORKBOOK` effectively does anyway?
+- `ImportJob` has no `updated_at` and no way to change status yet. When Phase 20 sets
+  `COMPLETED`, does it get the same `onupdate` treatment `Invoice` has?
+
+### One architecture decision I can now explain
+
+**Why structural and business validation are different layers.**
+
+It would be simpler to have one validation pass over an uploaded file: open it, read the rows,
+check the invoices, return everything that is wrong. One function, one error list, one report.
+
+The reason not to is that the two kinds of failure have nothing in common except timing.
+"Missing column `vendor`" is a fact about the file, is the same for every row, and is fixed by
+downloading a fresh template. "Invoice INV-1008 duplicates one from March" is a fact about one
+invoice's relationship to stored data, is fixed by editing that invoice, and may be perfectly
+correct in a file whose structure is flawless. Mixing them produces a report where a user has
+to sort out which of forty errors are one problem and which are forty.
+
+They also fail at different times, and that matters more as the system grows. Structural
+validation happens once, cheaply, at upload — and can reject a file in milliseconds without
+touching the database. Business validation runs per invoice, needs the database for duplicate
+detection, and in Phase 32 moves to a worker minutes later. A single pass would force the
+expensive path to wait on the cheap one, or the cheap one to be repeated in the worker.
+
+The demonstration is the test I found most satisfying to write: a file whose rows contain
+negative quantities, a currency that does not exist, a date in 2099, and totals that do not
+add up, returns `201`. It is a perfectly good spreadsheet. Everything wrong with it is
+somebody else's job.
+
+**A layer should have exactly one question, and be able to answer it without asking anyone
+else.**
+
+### Interview questions I should be able to answer
+
+1. What is the difference between structural and business validation of an import file?
+2. Why do the structural checks stop at the first failure when business rules do not?
+3. Why does a structurally valid file full of invalid invoices return `201`?
+4. How would you guarantee the template you publish is one your importer accepts?
+5. When is a prefixed string id better than an integer, and what does it cost?
+6. Why does the template version only affect the error message, not acceptance?

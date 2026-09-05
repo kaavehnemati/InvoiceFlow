@@ -11,7 +11,7 @@ from app.db.base import Base
 # Importing the model looks unused, and is not: it is what registers the
 # invoices table on Base.metadata, so --autogenerate has something to compare
 # the live database against. Every future model needs an import here too.
-from app.models import invoice  # noqa: F401
+from app.models import import_job, invoice  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

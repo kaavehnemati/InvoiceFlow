@@ -4,7 +4,9 @@ from fastapi import Depends
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
+from app.repositories.import_job_repository import ImportJobRepository
 from app.repositories.invoice_repository import InvoiceRepository
+from app.services.import_service import ImportService
 from app.services.invoice_service import InvoiceService
 
 
@@ -39,6 +41,22 @@ def get_invoice_service(repository: InvoiceRepositoryDep) -> InvoiceService:
 
 
 InvoiceServiceDep = Annotated[InvoiceService, Depends(get_invoice_service)]
+
+
+def get_import_job_repository(session: DbSession) -> ImportJobRepository:
+    return ImportJobRepository(session)
+
+
+ImportJobRepositoryDep = Annotated[
+    ImportJobRepository, Depends(get_import_job_repository)
+]
+
+
+def get_import_service(repository: ImportJobRepositoryDep) -> ImportService:
+    return ImportService(repository)
+
+
+ImportServiceDep = Annotated[ImportService, Depends(get_import_service)]
 
 # Each provider asks for the one above it rather than building it, so FastAPI
 # resolves the whole chain -- session -> repository -> service -- and every

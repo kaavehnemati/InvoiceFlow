@@ -2,11 +2,11 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 16 — Excel import template. The import contract is published as a
-downloadable `.xlsx`. Behind it: invoices with line items whose amounts are derived and
-reconciled, three layers wired by FastAPI, a validated settings object, domain exceptions
-translated to HTTP in one place, structured logging, and 92 tests. Nothing can be uploaded
-yet. That is addressed by a later
+**Current status:** Phase 17 — Excel upload. Files can be uploaded and checked for
+structure, producing an `ImportJob`. Nothing reads the rows yet. Behind it: the published
+import contract, invoices with line items whose amounts are derived and reconciled, three
+layers wired by FastAPI, a validated settings object, domain exceptions translated to HTTP in
+one place, structured logging, and 109 tests. That is addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -201,6 +201,58 @@ reported as such, rather than failing on a missing column and leaving the user t
 
 Bump `TEMPLATE_VERSION` whenever the columns change.
 
+## Uploading an import file
+
+```bash
+curl -X POST http://127.0.0.1:8000/imports -F "file=@march-invoices.xlsx"
+```
+
+```json
+{"id":"imp_78fe620d94f6","filename":"march-invoices.xlsx","status":"UPLOADED",
+ "created_at":"2026-09-05T19:59:42.800405+03:30"}
+```
+
+### Structure is not business validation
+
+This endpoint answers one question: **is this a spreadsheet I can read?** It does not look at
+a single invoice. A file whose rows contain negative quantities, a currency that does not
+exist, and totals that do not add up is still *structurally* valid, and returns `201`.
+
+Whether those invoices are any good is Phase 20's question. Keeping the two apart is what
+stops an import report from being an unreadable mix of "column missing" and "invoice INV-1008
+is a duplicate".
+
+| Check | Issue code |
+| --- | --- |
+| Filename ends in `.xlsx` | `INVALID_FILE_TYPE` |
+| The upload is not empty | `EMPTY_FILE` |
+| It opens as a workbook | `UNREADABLE_WORKBOOK` |
+| It has an `Invoices` sheet | `WORKSHEET_MISSING` |
+| Every required column is present | `MISSING_COLUMNS` |
+| There is at least one data row | `NO_DATA_ROWS` |
+
+Failures return `422` with the same `{code, field, message}` shape as business rules, so a
+client parses one kind of error body. Unlike business rules these stop at the first problem —
+there is nothing useful to say about the columns of a file that is not a workbook.
+
+The messages are meant to be readable by whoever prepared the file:
+
+```text
+missing required column(s): vendor. This file was made from template v0;
+the current template is v1.
+```
+
+That version hint appears **only** when the columns fail. A file whose columns are right
+imports whatever version it declares, including none — hand-built files have no version cell
+and are perfectly valid.
+
+### Two id styles
+
+`ImportJob.id` is a prefixed string (`imp_78fe620d94f6`); `Invoice.id` is an integer. That is
+a real inconsistency, chosen deliberately: an import id travels through URLs, logs and support
+conversations, where `imp_78fe620d94f6` is unambiguous about what it refers to and needs no
+parsing at the boundary. Invoice ids never left the database's control.
+
 ## Testing
 
 ```bash
@@ -210,7 +262,7 @@ uv run pytest
 One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 
 ```text
-90 passed, 2 xfailed in 0.60s
+107 passed, 2 xfailed in 0.80s
 ```
 
 | File | Category | Tests |
@@ -222,6 +274,7 @@ One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 | `test_architecture.py` | the layering rules, as assertions | 5 |
 | `test_items.py` | line items — rules, derivation, storage | 24 |
 | `test_template.py` | the import contract | 12 |
+| `test_imports.py` | upload and structural validation | 17 |
 | `test_concurrency.py` | the duplicate race (`xfail`) | 1 |
 
 ### Your development data is safe
@@ -581,6 +634,14 @@ playbook introduces each fix only once the problem is visible.
 | Duplicate detection is check-then-insert with no constraint underneath, so two *concurrent* requests can both pass the check and both write | see below | Phase 33 — idempotency |
 | Amounts with more than 2 decimal places are **silently rounded** by the database, which can break an invoice that passed validation | `POST` `subtotal:"0.005", tax:"0.005", total:"0.010"` → `201`, stored as `0.01 + 0.01 = 0.01` | unowned — see below |
 | Nothing ever modifies an invoice, so `updated_at` always equals `created_at` | — | Phase 39 — review workflow |
+| An upload is read into memory whole, with no size limit | `POST /imports` a very large file | Phase 45 — security hardening |
+| The uploaded file is not kept. Phases 18–21 process it in the same request, so there is nothing to re-read if processing fails | — | Phase 31 — S3 storage |
+| The template's currency list is **hardcoded prose** (`"EUR, USD or GBP"`) duplicating `SUPPORTED_CURRENCIES`. Adding a currency would make the template say something false | add a currency to the service; the template does not change | unowned |
+| The template's worked example is not checked against the validator, so an edit could ship an example the API would reject | change a number in `_EXAMPLE_ROWS`; nothing fails | unowned |
+
+The last two were found while reviewing Phase 16 and deliberately left. They are the same
+class of problem that phase claimed to solve — a second source of truth that nothing keeps
+honest — which is worth recording rather than quietly forgetting.
 
 One thing worth knowing about the current validation: **unknown fields are ignored, not
 rejected.** `{"...": ..., "nonsense": true}` succeeds and `nonsense` is simply dropped. This
@@ -645,12 +706,14 @@ recorded here rather than fixed silently.
 │   ├── repositories/
 │   │   └── invoice_repository.py   # All invoice SQL lives here
 │   ├── routers/
+│   │   ├── imports.py       # Upload endpoint
 │   │   ├── invoices.py      # HTTP only: routes, status codes
 │   │   └── templates.py     # The import template download
 │   ├── schemas/
 │   │   └── invoice.py       # InvoiceCreate, InvoiceRead
 │   └── services/
 │       ├── invoice_service.py      # Business rules and invoice creation
+│       ├── import_service.py       # Structural validation of uploads
 │       └── excel_template.py       # The import contract, and the .xlsx builder
 ├── migrations/
 │   ├── env.py               # Alembic config; reads DATABASE_URL
@@ -664,6 +727,7 @@ recorded here rather than fixed silently.
 │   ├── test_api.py          # API — TestClient, status codes
 │   ├── test_items.py        # Line items — rules, derivation, storage
 │   ├── test_template.py     # The import contract
+│   ├── test_imports.py      # Upload and structural validation
 │   ├── test_architecture.py # The layering rules, as assertions
 │   └── test_concurrency.py  # The duplicate race (xfail)
 ├── pytest.ini
