@@ -2519,3 +2519,127 @@ a plausible-looking wrong answer.
 4. Why skip blank rows instead of reporting them?
 5. A test passes. What would have to be true for it to be passing for the wrong reason?
 6. Where should whitespace and casing be normalised, and why not in the business rules?
+
+---
+
+## Phase 19 — Group Rows into Invoices
+
+### What I learned
+
+**Aggregation.** Nine rows became two invoices with five lines between them, plus two flagged:
+
+```text
+INV-1001  ABC GmbH  2026-01-15  EUR  rows [2, 3, 4]
+    row 2  Consulting   2 x 100 @19%
+    row 3  Travel       1 x 50  @19%
+    row 4  Materials    1 x 25  @19%
+```
+
+The grouping key is `vendor + invoice_number`, compared exactly — the same rule Phase 9's
+duplicate check already uses. Two components that both decide "is this the same invoice"
+have to decide it the same way, or a later phase inherits a disagreement nobody planned.
+
+**Cross-row validation is a failure mode a single row cannot have.** Five columns describe the
+invoice rather than the line and repeat on every row, so two rows can each be individually
+perfect and jointly contradictory:
+
+```text
+Invoice INV-3003 -> INCONSISTENT_INVOICE_FIELD
+    rows of this invoice disagree about currency: row 7 says EUR; row 8 says USD
+```
+
+Neither row is wrong. The invoice is. Phase 18 could not have caught this, because Phase 18
+only ever sees one row at a time.
+
+**Domain consistency means the aggregate has invariants the parts do not.** An `InvoiceItem`
+has no currency; an `Invoice` does. The moment rows become an aggregate, facts that were
+merely repeated become facts that must agree.
+
+**Errors changed shape, and that was a signal.** Parser errors name a *row*; grouping errors
+name an *invoice*. I did not invent that split — Phase 21's spec has it:
+
+```text
+Row 12      -> missing vendor
+Invoice ... -> total mismatch
+```
+
+Reading two phases ahead told me what shape this phase's output needed.
+
+**One phase's need drove a small change to the previous one.** Rejecting an incomplete invoice
+requires knowing which invoice a *failed* row belonged to, and `RowError` carried only a row
+number. It gained `invoice_number` and `vendor`, best-effort — a row that fails on
+`quantity: "two"` usually has perfectly readable identity cells. The change was additive, so
+all 22 of Phase 18's tests passed untouched. The parser grew a field at the moment something
+needed it, which is the same earn-it rule applied backwards.
+
+### Why this phase was needed
+
+The parser returned a flat list of rows, and nothing turned the repetition in a spreadsheet
+back into the invoices it represents.
+
+### What problem existed before it
+
+No aggregate, and therefore no way to notice that two rows claiming to be the same invoice
+disagreed about it.
+
+### New concepts
+
+- Aggregation by a composite key
+- Cross-row validation, and invariants that exist only at the aggregate level
+- Error scope — row-level versus entity-level
+- Reporting the cause rather than the symptom
+- Vocabulary translation at a boundary (`item` → `description`)
+
+### Things I still do not fully understand
+
+- Grouping holds every row in memory. For Phase 40's 100,000-file batch, does grouping have to
+  become streaming, or is per-file grouping always small enough?
+- An invoice whose rows are scattered through the file groups fine, but a report listing them
+  in first-appearance order may still look odd. Should the report sort by invoice number
+  instead?
+- `INCOMPLETE_INVOICE` fires when a row fails to parse. What if a user genuinely deleted a
+  line and adjusted the totals? Then there is no error, and there should not be — but the
+  distinction is invisible to us.
+
+### One architecture decision I can now explain
+
+**Why nothing wins a disagreement — and why that is now a principle, not a judgement call.**
+
+When two rows of one invoice disagree about the currency, there are obvious resolutions:
+take the first row, take the majority, take the most common value in the file. Each is one
+line of code and each makes the import succeed more often.
+
+All of them are wrong for the same reason. The data does not say which reading is correct, so
+any rule that picks one is manufacturing a fact. The invoice imports, looks plausible, and is
+denominated in a currency nobody chose. Rejecting it produces a message someone can act on:
+*"row 7 says EUR; row 8 says USD"*.
+
+This is the third time this project has made that trade, and the third time is when it stops
+being a judgement call and becomes a rule:
+
+| Phase | Ambiguity | Choice |
+| --- | --- | --- |
+| 12 | Invoice is both malformed and a duplicate | Report the malformation; do not guess which matters more |
+| 18 | `01/02/2026` is 2 January or 1 February | Refuse the format entirely |
+| 19 | Two rows disagree about the currency | Reject the invoice; name both values |
+
+The same shape underlies the fourth decision here too. An invoice missing one unreadable line
+*could* be built from the rows that survived — and would then fail Phase 20's reconciliation
+with *"subtotal is 250.00 but lines sum to 200.00"*. That error is true and useless: it sends
+someone to check arithmetic when the cause is one bad cell two rows away, and it invites the
+worst possible fix, editing the declared totals to match and importing an invoice with a line
+silently missing.
+
+**Where input is ambiguous, refuse it and say why. A visible error costs someone five minutes;
+a plausible wrong answer costs them a quarter-end.** Leniency is a virtue when the cost of a
+wrong guess is an error, and a defect when the cost is a wrong answer that looks right.
+
+### Interview questions I should be able to answer
+
+1. What validation becomes possible only after you aggregate rows into an entity?
+2. Two rows of one invoice disagree about the currency. What should happen, and why not
+   first-row-wins?
+3. Why must grouping and duplicate detection compare keys the same way?
+4. An invoice has three rows and one fails to parse. Build it from two, or reject it?
+5. When is an error message technically true and still harmful?
+6. Why do some errors name a row and others name an invoice?
