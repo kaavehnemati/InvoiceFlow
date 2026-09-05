@@ -2643,3 +2643,138 @@ wrong guess is an error, and a defect when the cost is a wrong answer that looks
 4. An invoice has three rows and one fails to parse. Build it from two, or reject it?
 5. When is an error message technically true and still harmful?
 6. Why do some errors name a row and others name an invoice?
+
+---
+
+## Phase 20 — Excel Business Validation and Import Report
+
+### What I learned
+
+**The headline, after three phases of building parts that did nothing:**
+
+```text
+upload 1-VALID-upload-me.xlsx
+  -> COMPLETED  total_rows 2  invoices_created 1
+
+ invoice_number | vendor   | subtotal | tax   | total
+ INV-2026-3001  | Acme Ltd |   250.00 | 47.50 | 297.50
+
+ description       | qty | unit_price | line_subtotal | line_tax | line_total
+ Consulting hours  | 2   | 100.00     |        200.00 |    38.00 |     238.00
+ Travel expenses   | 1   |  50.00     |         50.00 |     9.50 |      59.50
+```
+
+Two spreadsheet rows became one invoice with two line items, amounts derived by the server and
+summing exactly to the declared totals.
+
+**Reuse is a claim, so it needs a test that can fail.** The Definition of Done says imports
+must run *the same* business logic as manual creation. The test that enforces it submits one
+invoice both ways and compares issue codes:
+
+```python
+assert api_codes == import_codes
+```
+
+My first version of it was wrong in an instructive way. It failed with
+`'NEGATIVE_AMOUNT' != 'LINE_TOTAL_MISMATCH'`, and my instinct was that the code had diverged.
+It had not: the JSON payload had **no line items** while every spreadsheet row produces one,
+so the two paths were being given different invoices. **A comparison test is only as good as
+the claim that both sides received the same input.**
+
+**Break-testing caught me constructing a useless break.** My first attempt at "reimplement a
+rule in the import path" added `XYZ` to an allowed set — which meant `INVALID_CURRENCY` still
+came from the real service, so nothing failed. A break that does not change behaviour proves
+nothing. Two properly divergent breaks — re-coding the service's errors, and validating
+currency locally — both failed the reuse test, which is what I needed to see.
+
+**A repeated invoice number inside one file is not a duplicate.** It is another line item.
+Grouping is by `vendor + invoice_number`, so two rows sharing both are two lines of one
+invoice — which is precisely how a three-line invoice is written. I discovered this by
+building a "duplicate" into a test file and watching it come back as `LINE_TOTAL_MISMATCH`,
+because the invoice now had three lines summing to 450.00 against a declared 250.00. The
+behaviour is right and my expectation was wrong.
+
+Duplicates therefore only arise against invoices already stored, which makes re-uploading a
+file safe: `created=1 duplicates=0`, then `created=0 duplicates=1`.
+
+**Migrations, with the Phase 7 lesson applied.** Seven `NOT NULL` count columns on a populated
+table would normally need the add-nullable / backfill / enforce dance. Setting
+`server_default="0"` on the model made autogenerate emit a migration that is safe on existing
+rows without any of it — the lesson learned there was not "write three steps" but "know why
+the one step fails".
+
+### Why this phase was needed
+
+Everything required to import a spreadsheet existed and none of it was connected. Phase 17
+accepted files and discarded them; Phases 18 and 19 built the parts. `POST /imports` returned
+`201` and created nothing, which was the honest headline for three phases.
+
+### What problem existed before it
+
+No path from a spreadsheet to an invoice, and no report on what an upload did.
+
+### New concepts
+
+- Wiring independently-built and independently-tested stages into a pipeline
+- Reuse as a testable property rather than a claim in a commit message
+- Report counts at two granularities, with invariants that can be asserted
+- Persisting errors because their source is discarded
+- Status meaning "finished", with the detail in the counts
+
+### Things I still do not fully understand
+
+- Each invoice commits separately, so a file half-imports if the process dies mid-way. The
+  `ImportJob` would be left `UPLOADED` with no counts. Is that Phase 22's problem or Phase 33's?
+- `_process` runs inside the request. A 20,000-row file would hold a connection for minutes —
+  which is exactly Phase 32's stated motivation, but is there a size at which it should refuse
+  rather than try?
+- Errors are truncated to 500 characters on the way in. Is a truncated message worse than a
+  column with no limit?
+
+### One architecture decision I can now explain
+
+**What eleven phases of layering actually bought, measured here.**
+
+The whole import path is one call:
+
+```python
+self.invoice_service.create(to_invoice_create(grouped))
+```
+
+Everything else in `_process` is bookkeeping — counting, and writing down what went wrong. Not
+one business rule is restated. Six phases of decisions made that possible, and each was
+justified at the time by an argument about *this* phase:
+
+| Phase | Decision | Why it mattered here |
+| --- | --- | --- |
+| 4 | `validate_invoice` returns data, raises nothing | callable in a loop over hundreds of invoices |
+| 9 | rules moved out of the router | reachable without an HTTP request |
+| 12 | domain exceptions, not `HTTPException` | catchable by a caller with no response to send |
+| 12 | duplicate check moved out of `validate()` | `validate()` stayed pure |
+| 15 | `derive_line_amounts` in one place | imported and typed invoices compute identically |
+| 19 | grouper returns plain dataclasses | nothing to unpick before calling the service |
+
+Every one of those had a cheaper alternative at the time, and every argument for the more
+expensive option was a promise about a phase that had not been written. Phase 9's log said the
+tuple was worth it because "a bulk importer needs a service that does not raise HTTP errors".
+That was speculation. This is the invoice.
+
+The measurable result: `import_service.py` gained about 90 lines, and **zero** of them are a
+business rule. The alternative — an import path with its own copy of the rules — would have
+worked on day one and drifted by Phase 39, when the review workflow changes what `VALID`
+means and only one of the two copies gets updated.
+
+**Layering is not free and does not pay off evenly.** It cost something in every phase from 8
+to 19 and paid all of it back in one. The discipline that made it work was refusing to add a
+layer until a concrete pain existed — and being able to name the future caller each layer was
+for.
+
+### Interview questions I should be able to answer
+
+1. How do you prove that two entry points share business logic, rather than asserting it?
+2. Why is a repeated invoice number in one spreadsheet not a duplicate?
+3. What does `COMPLETED` mean on an import with 57 bad rows, and why not `PARTIALLY_COMPLETED`?
+4. Why must import errors be persisted rather than recomputed?
+5. Adding seven `NOT NULL` columns to a populated table — when does it need a backfill and when
+   does it not?
+6. Name a decision from an earlier phase that only paid off here, and what it cost meanwhile.

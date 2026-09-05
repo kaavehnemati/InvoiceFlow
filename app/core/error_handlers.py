@@ -7,6 +7,7 @@ from sqlalchemy.exc import DataError
 from app.core.exceptions import (
     DuplicateInvoiceError,
     ImportFileError,
+    ImportJobNotFoundError,
     InvoiceNotFoundError,
     InvoiceValidationError,
 )
@@ -28,6 +29,12 @@ def register_exception_handlers(app: FastAPI) -> None:
         request: Request, exc: InvoiceNotFoundError
     ) -> JSONResponse:
         return JSONResponse(status_code=404, content={"detail": "Invoice not found"})
+
+    @app.exception_handler(ImportJobNotFoundError)
+    async def handle_import_not_found(
+        request: Request, exc: ImportJobNotFoundError
+    ) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": "Import not found"})
 
     @app.exception_handler(DuplicateInvoiceError)
     async def handle_duplicate_invoice(

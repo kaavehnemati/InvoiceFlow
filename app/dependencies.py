@@ -52,8 +52,10 @@ ImportJobRepositoryDep = Annotated[
 ]
 
 
-def get_import_service(repository: ImportJobRepositoryDep) -> ImportService:
-    return ImportService(repository)
+def get_import_service(
+    repository: ImportJobRepositoryDep, invoice_service: InvoiceServiceDep
+) -> ImportService:
+    return ImportService(repository, invoice_service)
 
 
 ImportServiceDep = Annotated[ImportService, Depends(get_import_service)]

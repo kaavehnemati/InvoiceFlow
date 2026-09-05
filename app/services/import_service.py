@@ -16,9 +16,18 @@ from io import BytesIO
 
 from openpyxl import load_workbook
 
-from app.core.exceptions import ImportFileError
+from app.core.exceptions import (
+    DuplicateInvoiceError,
+    ImportFileError,
+    InvoiceValidationError,
+)
+from app.models.import_job import ImportError as ImportErrorRow
 from app.models.import_job import ImportJob
 from app.repositories.import_job_repository import ImportJobRepository
+from app.schemas.invoice import InvoiceCreate, InvoiceItemCreate
+from app.services.excel_grouper import GroupedInvoice, group_rows
+from app.services.excel_parser import parse_rows
+from app.services.invoice_service import InvoiceService
 from app.services.excel_template import (
     COLUMN_NAMES,
     SHEET_NAME,
@@ -135,11 +144,45 @@ def validate_workbook_structure(filename: str, content: bytes) -> list[dict]:
     return []
 
 
-class ImportService:
-    """Turns an uploaded file into an ImportJob, or refuses it."""
+def to_invoice_create(grouped: GroupedInvoice) -> InvoiceCreate:
+    """A grouped spreadsheet invoice, as the API's own request model.
 
-    def __init__(self, repository: ImportJobRepository):
+    This mapping is the only new logic in the import path. Everything that
+    decides whether the invoice is acceptable is borrowed from
+    InvoiceService -- the same object a JSON request goes through.
+
+    The spreadsheet says declared_subtotal and item; the domain says subtotal
+    and description. Phase 16 documented those mappings; this is where they
+    are applied.
+    """
+    return InvoiceCreate(
+        invoice_number=grouped.invoice_number,
+        vendor=grouped.vendor,
+        invoice_date=grouped.invoice_date,
+        currency=grouped.currency,
+        subtotal=grouped.declared_subtotal,
+        tax=grouped.declared_tax,
+        total=grouped.declared_total,
+        items=[
+            InvoiceItemCreate(
+                description=item.description,
+                quantity=item.quantity,
+                unit_price=item.unit_price,
+                tax_rate=item.tax_rate,
+            )
+            for item in grouped.items
+        ],
+    )
+
+
+class ImportService:
+    """Turns an uploaded file into invoices, and reports what happened."""
+
+    def __init__(
+        self, repository: ImportJobRepository, invoice_service: InvoiceService
+    ):
         self.repository = repository
+        self.invoice_service = invoice_service
 
     def create_from_upload(self, filename: str, content: bytes) -> ImportJob:
         """Check the file's structure and record that it arrived.
@@ -177,4 +220,116 @@ class ImportService:
                 "context": {"import_id": created.id, "filename": created.filename}
             },
         )
+
+        self._process(created, content)
         return created
+
+    def _process(self, job: ImportJob, content: bytes) -> None:
+        """Parse, group, validate and store every invoice in the file.
+
+        Each invoice is created through InvoiceService.create() -- the same
+        call a JSON request makes. Not similar rules: the same object, raising
+        the same domain exceptions. That is the whole point of the layering,
+        and tests/test_import_report.py has a test that fails the moment
+        anyone reimplements a rule here.
+
+        Each invoice commits on its own, so one bad invoice does not cost the
+        good ones. That currently falls out of InvoiceRepository.create()
+        committing rather than from anyone deciding it, which is exactly what
+        Phase 22 exists to make deliberate.
+        """
+        rows, row_errors = parse_rows(content)
+        invoices, invoice_errors = group_rows(rows, row_errors)
+
+        stored_errors: list[ImportErrorRow] = [
+            ImportErrorRow(
+                import_id=job.id,
+                scope="row",
+                row_number=error.row_number,
+                invoice_number=error.invoice_number or None,
+                vendor=error.vendor or None,
+                code=error.code,
+                field=error.field,
+                message=error.message[:500],
+            )
+            for error in row_errors
+        ]
+
+        failed = 0
+        duplicates = 0
+
+        for error in invoice_errors:
+            failed += 1
+            stored_errors.append(
+                ImportErrorRow(
+                    import_id=job.id,
+                    scope="invoice",
+                    row_number=None,
+                    invoice_number=error.invoice_number or None,
+                    vendor=error.vendor or None,
+                    code=error.code,
+                    field=error.field,
+                    message=error.message[:500],
+                )
+            )
+
+        created_count = 0
+        for grouped in invoices:
+            try:
+                self.invoice_service.create(to_invoice_create(grouped))
+                created_count += 1
+            except InvoiceValidationError as exc:
+                failed += 1
+                for issue in exc.issues:
+                    stored_errors.append(
+                        ImportErrorRow(
+                            import_id=job.id,
+                            scope="invoice",
+                            row_number=None,
+                            invoice_number=grouped.invoice_number,
+                            vendor=grouped.vendor,
+                            code=issue["code"],
+                            field=issue.get("field"),
+                            message=str(issue["message"])[:500],
+                        )
+                    )
+            except DuplicateInvoiceError as exc:
+                duplicates += 1
+                stored_errors.append(
+                    ImportErrorRow(
+                        import_id=job.id,
+                        scope="invoice",
+                        row_number=None,
+                        invoice_number=grouped.invoice_number,
+                        vendor=grouped.vendor,
+                        code="DUPLICATE_INVOICE",
+                        field="invoice_number",
+                        message=str(exc)[:500],
+                    )
+                )
+
+        invalid_rows = len({error.row_number for error in row_errors})
+
+        job.total_rows = len(rows) + invalid_rows
+        job.valid_rows = len(rows)
+        job.invalid_rows = invalid_rows
+        job.invoices_found = len(invoices) + len(invoice_errors)
+        job.invoices_created = created_count
+        job.invoices_failed = failed
+        job.duplicate_invoices = duplicates
+        job.status = "COMPLETED"
+
+        self.repository.save_with_errors(job, stored_errors)
+
+        logger.info(
+            "import_processed",
+            extra={
+                "context": {
+                    "import_id": job.id,
+                    "total_rows": job.total_rows,
+                    "invoices_created": job.invoices_created,
+                    "invoices_failed": job.invoices_failed,
+                    "duplicate_invoices": job.duplicate_invoices,
+                }
+            },
+        )

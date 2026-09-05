@@ -17,3 +17,14 @@ class ImportJobRead(BaseModel):
     filename: str
     status: str
     created_at: datetime
+
+    # Row-level and invoice-level counts answer different questions.
+    #   total_rows     = valid_rows + invalid_rows
+    #   invoices_found = created + failed + duplicates
+    total_rows: int
+    valid_rows: int
+    invalid_rows: int
+    invoices_found: int
+    invoices_created: int
+    invoices_failed: int
+    duplicate_invoices: int
