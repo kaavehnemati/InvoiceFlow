@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 
 from openpyxl import load_workbook
+from sqlalchemy.exc import DataError
 
 from app.core.exceptions import (
     DuplicateInvoiceError,
@@ -305,6 +306,37 @@ class ImportService:
                         code="DUPLICATE_INVOICE",
                         field="invoice_number",
                         message=str(exc)[:500],
+                    )
+                )
+            except DataError:
+                # A DB-level failure -- e.g. an amount too large for
+                # NUMERIC(12,2) -- leaves the session unusable until it is
+                # explicitly rolled back. Without this, every invoice after
+                # this one in the same import would also fail, the whole
+                # import would abort before its counts and errors were ever
+                # written, and the client would see a bare 422 for the entire
+                # upload instead of a completed report. Verified directly:
+                # rollback() recovers the session, and the next create() on it
+                # succeeds normally.
+                #
+                # Same exception, same code, as a single JSON request would
+                # get from Phase 12's handler -- one failure produces one
+                # meaning, whether it arrives alone or as one row in a much
+                # larger file.
+                self.repository.session.rollback()
+                failed += 1
+                stored_errors.append(
+                    ImportErrorRow(
+                        import_id=job.id,
+                        scope="invoice",
+                        row_number=None,
+                        invoice_number=grouped.invoice_number,
+                        vendor=grouped.vendor,
+                        code="AMOUNT_OUT_OF_RANGE",
+                        field=None,
+                        message=(
+                            "an amount is outside the range this system can store"
+                        ),
                     )
                 )
 

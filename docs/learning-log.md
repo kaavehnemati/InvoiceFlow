@@ -2869,3 +2869,101 @@ row 4 say" that isn't fully determined by the row already on disk.
 3. Why does an import with zero errors return `200`, while an unknown import returns `404`?
 4. Why is `total` in a paginated response the full count, not the count of the current page?
 5. What did checking real output against a written plan catch that reasoning alone had not?
+
+
+## Phase 22 — Transaction Boundaries
+
+### What I learned
+
+**Verify before planning, not after.** The playbook's Phase 22 objective — "prevent partially
+persisted invoice aggregates," "decide explicitly how Excel imports behave" — reads like two
+claims about the current code. Rather than assume either was already true or already broken, I
+reproduced both directly before writing a line of the plan. Half one (an invoice and its items
+either both persist or neither does) turned out to already hold — a forced item-level
+`NUMERIC(12,2)` overflow left zero rows in either table, because the relationship cascade puts
+both in one flush and one commit. Half two did not hold. That distinction — one half needing
+only a regression test, the other needing an actual fix — only existed because the
+reproduction ran first.
+
+**A silent skip is worse than a loud failure.** Before this phase, a DB-level exception
+(`DataError`) during `_process()`'s per-invoice loop was not caught anywhere. It propagated
+straight past `save_with_errors()`, so: every invoice after the failure point was silently
+never attempted, the `ImportJob` stayed at `status="UPLOADED"` with every count at zero
+forever, `import_errors` recorded nothing, and the client received a generic `422` for the
+*whole upload* — indistinguishable from "nothing happened," when in fact an earlier invoice in
+the same file had already committed. A retry of the identical file would then get that earlier
+invoice rejected as a duplicate, with no way to have known it succeeded the first time. I built
+a 3-invoice file (good, DB-failure, good) and ran it directly through
+`create_from_upload()` to see this exact sequence before touching any code.
+
+**A failed commit poisons the session until it is explicitly rolled back.** After `DataError`
+is raised, the SQLAlchemy session is left in a "pending rollback" state — any further use of it
+(even just a query, in a test asserting the outcome) raises `PendingRollbackError` instead of
+answering the question. I proved this twice: once by writing a test that queried the session
+right after the caught exception and watching it fail with exactly that, and once
+deliberately, isolating the mechanism in its own test (`test_session_recovers_after_a_rolled_back_failure`)
+that calls `create()` again on the same session immediately after the rollback and confirms it
+succeeds normally. The fix — `self.repository.session.rollback()` inside the new `except
+DataError` branch — depends entirely on that mechanism being true, not assumed.
+
+**The fix mirrors an exception handler that already existed, at a different layer.** Phase 12's
+single-invoice `POST /invoices` path already turns a `DataError` into `AMOUNT_OUT_OF_RANGE` at
+the router boundary. Phase 22 needed the same failure to mean the same thing when it shows up
+as one row inside a much larger import — same exception type, same error code, same message —
+so a business user (or an engineer debugging a support ticket) never has to learn that the
+identical failure reads differently depending on which endpoint it arrived through.
+
+### Why this phase was needed
+
+A single invoice failing at the database level was silently taking the rest of an import down
+with it, without a clear failure message and without any of the earlier successful writes
+being visible in the response.
+
+### What problem existed before it
+
+`_process()`'s per-invoice loop caught `InvoiceValidationError` and `DuplicateInvoiceError` and
+correctly continued past them, but had no branch for a DB-level failure — the one failure mode
+that leaves the session itself unusable rather than just rejecting one invoice.
+
+### New concepts
+
+- SQLAlchemy's "pending rollback" state: a failed `commit()` does not clean up after itself,
+  and the session stays unusable until `rollback()` is called explicitly
+- Reproducing a defect live, with a direct call to the service method under test, before
+  writing any test code or fix code
+- Break-testing with `git stash` rather than `git checkout -- <file>` when the change under
+  test is a small uncommitted diff, to avoid destroying work that hasn't been committed yet
+- Choosing the narrowest exception type that closes a reproduced defect (`DataError` alone)
+  over a broader one (`SQLAlchemyError`) that nothing has yet shown a need for
+
+### One architecture decision I can now explain
+
+**Verifying a claim before planning around it.**
+
+This phase's objective, read from the playbook, sounded like it described one already-solved
+problem with two names — "atomicity" and "one bad invoice doesn't cost the others" are both
+framed as guarantees the system should have. It would have been easy to write a plan that
+simply asserted both were satisfied, added a couple of confirming tests, and moved on; nothing
+in the code up to that point suggested otherwise.
+
+Instead the plan started as "confirm what the playbook asks for" and, only because the
+reproduction ran before any planning text was written, became "confirm, then fix what turned
+out to be false." The two halves of the objective are handled by different mechanisms
+entirely — one by an ORM behavior (cascade + single flush) that was already correct by
+construction, the other by a hand-written `try/except` loop that was incomplete by omission —
+and there was no way to tell which was which without forcing both failure modes and watching
+what actually happened. A plan built on the assumption that a stated objective is already met
+is only as good as that assumption; running the reproduction first turns it from an assumption
+into a fact the rest of the plan can safely build on.
+
+### Interview questions I should be able to answer
+
+1. Why does a failed `commit()` leave a SQLAlchemy session unusable until `rollback()` is
+   called, and what happens if you query that session before rolling it back?
+2. Why did invoice+item atomicity already hold before this phase, while "one bad invoice
+   doesn't cost the others" did not, even though both sound like the same guarantee?
+3. Why catch `DataError` specifically here, rather than the broader `SQLAlchemyError`?
+4. What does a client see differently before and after this fix, for the exact same uploaded
+   file?
+5. Why is reproducing a defect before writing a plan more reliable than reasoning about
+   whether the defect could exist?
