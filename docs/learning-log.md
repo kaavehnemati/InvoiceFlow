@@ -2778,3 +2778,94 @@ for.
 5. Adding seven `NOT NULL` columns to a populated table — when does it need a backfill and when
    does it not?
 6. Name a decision from an earlier phase that only paid off here, and what it cost meanwhile.
+
+---
+
+## Phase 21 — Import Error Report
+
+### What I learned
+
+**A short phase after a big one is still worth doing properly.** Every fact this endpoint
+needed already existed in `import_errors`; Phase 20 built the table and wrote the rows. This
+phase was formatting, one repository method, and one route — and it still found something
+worth correcting in my own plan before writing a line of code.
+
+**My plan assumed a shape the data doesn't have, and the tests caught it immediately.** I had
+written, without checking: *"row errors carry `row_number`, not `invoice_number`."* The first
+test I ran against real data disagreed — `invoice_number` was populated on a row-scoped error,
+because Phase 19 deliberately reads the identity cells before anything else fails, so a failed
+row can still be attributed to its invoice. That was a real design decision from two phases
+ago, and I had written a plan that quietly contradicted it. The fix was not to change the
+behavior; it was to fix the plan and the tests to describe what was actually built —
+
+```text
+row_error["invoice_number"] == "INV-1001"   # present, deliberately, per Phase 19
+```
+
+**A single bad cell produces two errors, correctly.** Uploading one row with an unreadable
+`quantity` stored *both* a `scope="row"` `INVALID_NUMBER` (the parse failure) and a
+`scope="invoice"` `INCOMPLETE_INVOICE` (because that row can never become a line, so grouping
+correctly refuses the whole invoice — Phase 19's rule). My test asserted "exactly one error"
+and failed against real output; the right assertion was "exactly one *row*-scoped error,"
+because the second error is a legitimate consequence, not a duplicate report of the same fact.
+
+**Two audiences, one payload, again.** Every existing error in this API is `{code, field,
+message}` for software. The playbook's own examples are prose — `"Row 12 → missing vendor"` —
+for a person reading a report. Rather than pick one, `summary` is computed once at the
+serialization boundary from the same stored fields, so a UI renders `summary` and anything
+automated still filters on `code`. This is the identical shape Phase 13 chose for logging
+(human lines locally, JSON where something parses it) and Phase 17 chose for `ImportFileError`
+issues — the same problem recurring at a third layer, solved the same way each time.
+
+**Pagination cost one indexed query and paid for a phase that hasn't been written yet.**
+`total`/`limit`/`offset` needed no new mechanism — the `import_id` foreign key was already
+indexed in Phase 20's migration. Verified live against 150 stored errors: default page
+returns 100, the next request with `offset=100` returns the remaining 50, and `total` stays
+150 throughout so a client can tell "100 of 150" from "100 of 100" without a second request.
+`limit`/`offset` bounds needed zero custom code — FastAPI's own `Query(ge=..., le=...)`
+rejects `limit=0`, `limit=1001`, and `offset=-1` with a `422` for free.
+
+### Why this phase was needed
+
+`invoices_failed: 3` on the Phase 20 report is a fact, not an instruction. A business user
+cannot fix "3" — they need to know it was rows 4 and 7, or invoice `INV-SPLIT`, and what was
+wrong with each.
+
+### What problem existed before it
+
+The counts existed; the detail behind them was written to a table nothing ever read.
+
+### New concepts
+
+- Computing a display field once at the API boundary rather than in every consumer
+- Offset pagination with a total count, and why `total` must not shrink to match the page
+- Distinguishing "no rows for this filter" (`200`, empty list) from "this resource does not
+  exist" (`404`) as two different failure shapes
+- Trusting live output over a written plan when the two disagree
+
+### One architecture decision I can now explain
+
+**Why `summary` is computed, not stored.**
+
+It would have been one column cheaper to render the summary string once, in
+`import_service.py`, at the moment the error is created, and store it alongside `code` and
+`message`. That was rejected for the same reason line amounts in Phase 15 *are* stored while
+this is not: a stored value is a fact about the past, frozen at the moment it was written. A
+summary has no independent fact to freeze — it is entirely a function of fields already
+stored (`scope`, `row_number` or `invoice_number`, `message`). Storing it would create a
+second copy of that function, and the two copies would eventually disagree the first time
+someone changed the phrasing in one place and not the other.
+
+The distinction that matters: **store what was true and cannot be recomputed. Compute what is
+only ever a rearrangement of what is already stored.** Line amounts pass the first test — a
+tax rate can change after the fact, so the number that was actually charged has to survive
+independently of the formula. A summary string fails it — there is no version of "what did
+row 4 say" that isn't fully determined by the row already on disk.
+
+### Interview questions I should be able to answer
+
+1. When should a display field be computed at read time versus stored at write time?
+2. Why can one bad spreadsheet cell produce two distinct, both-correct stored errors?
+3. Why does an import with zero errors return `200`, while an unknown import returns `404`?
+4. Why is `total` in a paginated response the full count, not the count of the current page?
+5. What did checking real output against a written plan catch that reasoning alone had not?
