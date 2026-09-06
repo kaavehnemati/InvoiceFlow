@@ -299,8 +299,10 @@ Everything below is a stated future phase in the project roadmap, not a gap disc
 - **Authentication, authorization, multi-tenancy** — every endpoint is currently open.
 - **Editing or deleting invoices** — `updated_at` exists on the schema but nothing ever
   changes an invoice after creation.
-- **Containerization and cloud deployment** — the application runs against a local
-  PostgreSQL instance; there is no Docker, CI/CD, or infrastructure-as-code yet.
+- **Cloud deployment and CI/CD** — Phase 23 packages the API, PostgreSQL, and its schema
+  migration into a `docker compose up` a developer can run locally with nothing manually
+  installed; there is still no deployment to any cloud target and no CI/CD or
+  infrastructure-as-code.
 
 The duplicate-invoice check (`vendor + invoice_number`) is also enforced only at the
 application layer via a query-then-insert pattern, not by a database `UNIQUE` constraint —

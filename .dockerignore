@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.git/
+.claude/
+docs/
+tests/
+*.md
+InvoiceFlow_Claude_Code_Implementation_Playbook.md
