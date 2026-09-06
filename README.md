@@ -2,25 +2,29 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 22 — transaction boundaries. **A single invoice failing at the
-database level can no longer take the rest of an import down with it.** Behind it: a
-readable error report behind the counts, uploading a spreadsheet creates invoices, parsing,
-grouping, structural checks, the published import contract, invoices with line items whose
-amounts are derived and reconciled, three layers wired by FastAPI, a validated settings
-object, domain exceptions translated to HTTP in one place, structured logging, and 187 tests.
-Dockerizing the application is addressed by a later
-phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
-and only once the previous phase makes the need for it obvious.
+**Current status:** Phase 23 — dockerized. **A new developer can run the whole application —
+FastAPI, PostgreSQL, and the schema migration that builds it — with `docker compose up` and
+nothing manually installed.** Behind it: a single invoice failing at the database level can no
+longer take the rest of an import down with it, a readable error report behind the counts,
+uploading a spreadsheet creates invoices, parsing, grouping, structural checks, the published
+import contract, invoices with line items whose amounts are derived and reconciled, three
+layers wired by FastAPI, a validated settings object, domain exceptions translated to HTTP in
+one place, structured logging, and 187 tests. Cloud deployment is addressed by a later phase of
+[the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md).
 
 ## Requirements
 
-- Python 3.12
-- [uv](https://docs.astral.sh/uv/) for environment and dependency management
-- PostgreSQL 16
+Either of two ways to run this, not both at once for the same purpose:
+
+- **Docker + Docker Compose** — see [Docker](#docker) below. No local Python, PostgreSQL, or
+  `uv` needed.
+- **Local** — Python 3.12, [uv](https://docs.astral.sh/uv/) for environment and dependency
+  management, PostgreSQL 16.
 
 > The system Python on this machine ships without `pip` and without `ensurepip`, so
 > `python3 -m venv` cannot bootstrap itself. `uv` handles both the virtual environment and
-> the installs without needing `sudo`.
+> the installs without needing `sudo`. This only matters for the local path — the Docker image
+> is built from a base image where `pip` already works.
 
 ## Database
 
@@ -700,6 +704,77 @@ With the server running:
 | <http://127.0.0.1:8000/docs> | Interactive Swagger UI |
 | <http://127.0.0.1:8000/openapi.json> | The generated OpenAPI schema |
 
+## Docker
+
+The whole application — API, database, and schema — runs with one command, no local Python,
+`uv`, or PostgreSQL install required:
+
+```bash
+docker compose up
+```
+
+### What that starts
+
+| Service | Image | Does |
+| --- | --- | --- |
+| `db` | `postgres:16` | The database. Data lives in a named volume, `pgdata`, not in the container. |
+| `migrate` | built from this repo's `Dockerfile` | Runs `alembic upgrade head` once, then exits. |
+| `app` | built from this repo's `Dockerfile` | Serves the API on `localhost:8000` once `migrate` finishes. |
+
+`migrate` is a separate service rather than something `app` does for itself on startup. This
+project has never let the application create its own tables — [Migrations](#migrations)
+above builds the schema explicitly, on purpose, so a schema change is always a reviewed
+migration file rather than a side effect of starting the process. Compose keeps that true:
+migrating is its own named step, visible in `docker compose ps` and `docker compose logs
+migrate`, not folded silently into `app`'s boot. `app` simply waits for it
+(`depends_on: condition: service_completed_successfully`), and running it again on an
+up-to-date schema is harmless — `alembic upgrade head` has nothing left to apply.
+
+`db`'s healthcheck (`pg_isready`) is what makes that wait meaningful in the first place:
+without it, Compose only knows the *container* has started, not that PostgreSQL inside it is
+actually accepting connections yet — a race that would otherwise show up as `migrate` failing
+intermittently on a cold start.
+
+### Verify
+
+Same checks as [Verify](#verify) above, against the containerized app:
+
+| URL | Expected |
+| --- | --- |
+| <http://127.0.0.1:8000/> | `{"message":"InvoiceFlow API"}` |
+| <http://127.0.0.1:8000/docs> | Interactive Swagger UI |
+
+### The database port is 5433, not 5432
+
+`db` is reachable from the host at `localhost:5433`, deliberately not `5432` — this project's
+own [Database](#database) section above has a developer install a *native* PostgreSQL on
+`5432` with these same `invoiceflow`/`invoiceflow` credentials. Both can run at once:
+
+```bash
+psql "postgresql://invoiceflow:invoiceflow@localhost:5433/invoiceflow" -c "select 1"
+```
+
+`app` and `migrate` never use this host port — inside the Compose network they reach `db` at
+its service name, `db:5432`, which the host mapping does not affect either way.
+
+### Data persistence
+
+The point of `pgdata` as a named volume rather than an anonymous one is that it survives the
+containers being recreated:
+
+```bash
+docker compose down      # stops and removes the containers; the volume is untouched
+docker compose up -d     # the same data is still there
+```
+
+To actually clear it — for a genuinely fresh database, the same situation `TRUNCATE` or
+`DROP SCHEMA` handle locally in [Resetting during development](#resetting-during-development) —
+remove the volume explicitly:
+
+```bash
+docker compose down -v   # this time, gone
+```
+
 ## API
 
 | Method | Path | Purpose |
@@ -1031,6 +1106,9 @@ recorded here rather than fixed silently.
 │   ├── env.py               # Alembic config; reads DATABASE_URL
 │   └── versions/            # One file per schema change
 ├── alembic.ini
+├── Dockerfile
+├── .dockerignore
+├── docker-compose.yml
 ├── tests/
 │   ├── conftest.py          # Rolled-back session, client, factories
 │   ├── test_validation.py   # Unit — pure rules, no database

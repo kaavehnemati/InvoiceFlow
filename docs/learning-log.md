@@ -2967,3 +2967,124 @@ into a fact the rest of the plan can safely build on.
    file?
 5. Why is reproducing a defect before writing a plan more reliable than reasoning about
    whether the defect could exist?
+
+
+## Phase 23 — Dockerize the Application
+
+### What I learned
+
+**The first phase with no Python source change, and that changes what "testing" means.**
+Every prior phase's Definition of Done was checked by `pytest`. This one packages what already
+exists, so the 187 tests had one job — keep passing, completely unmodified, proving the
+application itself was untouched — and verification of the actual DoD ("a new developer can
+run the project with Docker without manually installing PostgreSQL") had to be operational:
+build the image, bring the stack up, hit real endpoints, kill it and bring it back, and watch
+whether data survived. None of that is a thing `pytest` can assert for you.
+
+**A healthcheck is what makes `depends_on` mean anything.** Compose's default `depends_on`
+only waits for a container to *start*, not for the process inside it to be ready — Postgres's
+own startup takes a moment after the container itself is already "up". Without `db`'s
+`pg_isready` healthcheck and `migrate`'s `condition: service_healthy`, `migrate` would race
+Postgres and fail intermittently on a cold start. Watching `docker compose ps` mid-`up` showed
+the real sequence: `db` reaches `Healthy` before `migrate` is even allowed to start, and
+`migrate` has to reach `Exited (0)` before `app` starts — `condition: service_completed_
+successfully` is a different wait than `service_healthy`, because a one-shot command's success
+*is* it exiting, not staying up.
+
+**Keeping "build the schema explicitly" true meant migrations had to be their own service, not
+a step folded into `app`'s boot.** It would have been one line cheaper to run `alembic upgrade
+head && uvicorn ...` as `app`'s own command. That would have made the DoD true but would have
+hidden the migration inside a process whose logs are, ordinarily, about serving HTTP requests
+— exactly the "second source of truth nothing keeps honest" problem this project has hit
+before, just applied to *where a fact is visible* rather than *what the fact is*. With `migrate`
+separate, `docker compose ps` shows it as its own row, `docker compose logs migrate` shows
+only migration output, and a failed migration produces a container that visibly exited
+non-zero rather than an `app` container that half-started and then failed for an unrelated-
+looking reason.
+
+**Idempotency was verified, not assumed.** `alembic upgrade head` running again against an
+already-current schema needed to be a safe no-op, since `migrate` runs on every `docker compose
+up`, not just the first one. Confirmed directly: the first `up` logged all five migrations by
+name; a second `up` against the same volume logged only the two setup lines and nothing else,
+because there was nothing left to apply.
+
+**A port collision would have been a real, not hypothetical, problem.** This same README has a
+developer install a native PostgreSQL on `5432` with the same `invoiceflow`/`invoiceflow`
+credentials used everywhere else in the project. Mapping the containerized `db` to `5432` too
+would fail to bind the moment both were running — which, on this exact machine, is the normal
+case, since earlier phases' manual-testing setup left the native instance running. Verified
+both running at once on `5432` and `5433` simultaneously, via `pg_isready` against each.
+
+**The volume, not the image, is what makes data survive.** Proved both directions on the same
+running stack: `docker compose down` (no `-v`) then `up` again, and a specific invoice created
+moments earlier was still there — because `down` removes containers, not volumes. Then
+`docker compose down -v` and `up` again, and the same invoice was gone and the migration log
+showed the full chain running from scratch — proving the volume, specifically, was what had
+been holding the data, not something baked into the built image.
+
+### Why this phase was needed
+
+A new developer needed a local PostgreSQL installed, a Python virtual environment built with
+`uv`, and manually-run migrations before the API would answer a single request. None of that
+is specific to InvoiceFlow — it is entirely environment setup, and every prior phase's actual
+work was already fully independent of it.
+
+### What problem existed before it
+
+No Docker image, no Compose file — "run the project" meant "install PostgreSQL, install `uv`,
+build a virtual environment, run migrations," each a separate manual step with its own way to
+go wrong.
+
+### New concepts
+
+- Images versus containers, and why the same image can be `migrate` (a command that exits) and
+  `app` (a command that stays running)
+- `depends_on` conditions (`service_healthy`, `service_completed_successfully`) versus plain
+  `depends_on`, and the race the plain form does not protect against
+- Container networking: services address each other by service name (`db:5432`) regardless of
+  what, if anything, is mapped to the host
+- Port mapping as a host-side concern only — remapping `db` to `5433` changed nothing about how
+  `app` or `migrate` reach it
+- Named volumes as the actual unit of persistence, independent of both the image and the
+  container
+
+### One architecture decision I can now explain
+
+**Why migrating the schema is a separate Compose service instead of something `app` does for
+itself on startup.**
+
+The cheaper design is obvious: one container, one command, `alembic upgrade head && uvicorn
+app.main:app --host 0.0.0.0 --port 8000`. It satisfies the Definition of Done exactly as well
+— a fresh `docker compose up` still ends with a working, migrated API. The reason not to build
+it that way is the same reason a summary string is computed rather than stored (Phase 21), or
+a report is written to a table rather than left implicit in a log line (Phase 20): **a fact
+that matters should be visible in its own right, not produced as a side effect of something
+else running.**
+
+An `app` container whose command silently runs a migration first has two failure modes wearing
+one costume. If the migration fails, the symptom is "the app container won't start" — which is
+also the symptom of a broken `uvicorn` invocation, a missing dependency, or a crash in
+`app/main.py`. Someone debugging it has to read logs closely enough to notice the failure was
+actually in Alembic, at a moment when they are least inclined to read closely, because the
+obvious hypothesis is "the app is broken," not "the schema migration inside the app's startup
+script is broken." With `migrate` as its own service, that ambiguity cannot arise: `docker
+compose ps` shows `migrate` exited non-zero and `app` never started, and `docker compose logs
+migrate` shows only migration output, because that is the only thing that container ever runs.
+
+This mirrors the project's very first migration-related lesson (Phase 7): a `--autogenerate`
+migration should be *read*, not blindly trusted, because a schema change is a decision, not
+an automatic derivation. Making it a distinct, separately-observable step in Compose is the
+deployment-time version of the same idea — a schema change stays a named, visible event, never
+a fact buried inside a process whose job description is "serve HTTP requests."
+
+### Interview questions I should be able to answer
+
+1. Why does `depends_on: condition: service_healthy` need a healthcheck to mean anything?
+2. Why is `service_completed_successfully` a different condition from `service_healthy`, and
+   when does each apply?
+3. Why run schema migrations as their own Compose service instead of as part of the app
+   container's startup command?
+4. What specifically makes data survive `docker compose down`, and what removes it?
+5. Why did this phase's `pytest` requirement reduce to "the existing suite must not change,"
+   rather than "add new tests"?
+6. Two Postgres instances both claim port 5432. What actually breaks, and what doesn't?
