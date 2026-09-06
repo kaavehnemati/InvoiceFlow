@@ -285,8 +285,12 @@ and `?offset=` (≥ 0, default 0), validated by FastAPI itself.)
 
 Everything below is a stated future phase in the project roadmap, not a gap discovered here:
 
-- **Explicit transaction boundaries** — each invoice in a bulk import currently commits on
-  its own success/failure; there is no larger transaction wrapping a whole import.
+- **Recovering from an unexpected error mid-import** — Phase 22 catches the DB-level failure
+  that's actually been reproduced (`DataError`, e.g. an amount too large to store) so one bad
+  invoice no longer aborts the rest of the file. A *different*, still-unhandled exception
+  during processing leaves the `ImportJob` stuck at `status="UPLOADED"` forever, with every
+  count at zero and no stored explanation — closing that needs an `error_message` column and a
+  `FAILED` status transition wrapping the whole method, neither of which exists yet.
 - **File storage** — uploaded workbooks are parsed in memory and never saved; a failed
   import cannot be re-processed without re-uploading.
 - **Asynchronous processing** — imports run to completion inside the HTTP request; a very

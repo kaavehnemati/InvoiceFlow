@@ -2,13 +2,13 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 21 — import error report. **`GET /imports/{id}/errors` turns the
-counts into actionable detail** — which row, which invoice, which field, in plain language a
-business user can act on. Behind it: uploading a spreadsheet creates invoices, parsing,
+**Current status:** Phase 22 — transaction boundaries. **A single invoice failing at the
+database level can no longer take the rest of an import down with it.** Behind it: a
+readable error report behind the counts, uploading a spreadsheet creates invoices, parsing,
 grouping, structural checks, the published import contract, invoices with line items whose
 amounts are derived and reconciled, three layers wired by FastAPI, a validated settings
-object, domain exceptions translated to HTTP in one place, structured logging, and 180 tests.
-Explicit transaction boundaries are addressed by a later
+object, domain exceptions translated to HTTP in one place, structured logging, and 187 tests.
+Dockerizing the application is addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -402,6 +402,56 @@ are validated by FastAPI itself (`limit` 1–1000, `offset` ≥ 0) — no custom
 needed. An import with zero errors returns `200` and an empty list, not `404`; `404` is
 reserved for an import id that does not exist at all.
 
+## Transaction boundaries
+
+Two separate claims, both verified against real data before this phase changed anything.
+
+**An invoice and its line items already succeed or fail together.** They go through one
+`session.add()` and one `session.commit()`, so a failed item insert cannot leave a
+half-created invoice header behind. Confirmed by forcing an item-level `NUMERIC(12,2)`
+overflow (the header amounts stay in range; only one item's `unit_price` is too large) and
+checking the database afterward — zero rows in either table.
+
+**One invoice's database-level failure used to abort the rest of an import.** Before this
+phase, `_process()` caught business-rule failures and duplicates per invoice, but not a
+failure at the database itself. Reproduced directly: a three-invoice file — good, an invoice
+whose `unit_price` overflows `NUMERIC(12,2)`, good again — and the third invoice was **never
+even attempted**:
+
+```text
+INV-BEFORE  -> persisted (committed before the failure)
+INV-DBFAIL  -> correctly did not persist
+INV-AFTER   -> never attempted -- a valid invoice, silently skipped
+
+ImportJob   -> stuck at status="UPLOADED", every count at 0, forever
+POST /imports -> a bare 422 for the whole upload, though INV-BEFORE had already succeeded
+```
+
+A client retrying that exact file would then see `INV-BEFORE` rejected as a duplicate, with
+no way to have known it succeeded the first time.
+
+**Fixed the same way business-rule failures already were:** catch the failure per invoice,
+roll back the session (a failed commit leaves the session unusable until this runs —
+verified directly, not assumed), record it, and move on to the next invoice:
+
+```text
+POST /imports (same three-invoice file)
+  -> 201, status COMPLETED
+  invoices_created: 2   invoices_failed: 1
+
+invoices table -> INV-BEFORE, INV-AFTER   (both persisted)
+GET /imports/{id}/errors -> Invoice INV-DBFAIL → AMOUNT_OUT_OF_RANGE
+```
+
+Same exception (`sqlalchemy.exc.DataError`), same `AMOUNT_OUT_OF_RANGE` code, whether it
+arrives as one JSON request (Phase 12) or as one row inside a much larger file — one failure,
+one meaning, regardless of how it arrived.
+
+The fix is deliberately narrow: only `DataError` is caught here, matching what Phase 12
+already handles for a single invoice. A genuinely unexpected exception still aborts the
+request and surfaces through the 500 handler — see Known limitations below for what that
+currently leaves unresolved.
+
 ## Row parsing
 
 A cell is not a value. Excel hands back a float where you wanted a decimal, a `datetime` where
@@ -513,7 +563,7 @@ uv run pytest
 One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 
 ```text
-180 passed, 2 xfailed in 2.1s
+187 passed, 2 xfailed, 2 warnings in 4.54s
 ```
 
 | File | Category | Tests |
@@ -530,6 +580,7 @@ One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 | `test_grouper.py` | grouping and cross-row consistency | 23 |
 | `test_import_report.py` | the full import pipeline | 16 |
 | `test_import_errors.py` | the error report, pagination | 12 |
+| `test_transaction_boundaries.py` | atomicity, and one bad invoice not costing the rest | 7 |
 | `test_concurrency.py` | the duplicate race (`xfail`) | 1 |
 
 ### Your development data is safe
@@ -891,6 +942,7 @@ playbook introduces each fix only once the problem is visible.
 | Nothing ever modifies an invoice, so `updated_at` always equals `created_at` | — | Phase 39 — review workflow |
 | An upload is read into memory whole, with no size limit | `POST /imports` a very large file | Phase 45 — security hardening |
 | The uploaded file is not kept. Phases 18–21 process it in the same request, so there is nothing to re-read if processing fails | — | Phase 31 — S3 storage |
+| A genuinely unexpected exception during `_process()` (anything other than the `InvoiceValidationError`, `DuplicateInvoiceError`, and `DataError` Phase 22 handles) still propagates past `save_with_errors()`, leaving the `ImportJob` stuck at `status="UPLOADED"` forever with every count at 0 and no record of what went wrong | — | unowned — needs an `error_message` column and a `FAILED` status transition wrapping the whole method |
 | The template's currency list is **hardcoded prose** (`"EUR, USD or GBP"`) duplicating `SUPPORTED_CURRENCIES`. Adding a currency would make the template say something false | add a currency to the service; the template does not change | unowned |
 | The template's worked example is not checked against the validator, so an edit could ship an example the API would reject | change a number in `_EXAMPLE_ROWS`; nothing fails | unowned |
 
@@ -993,7 +1045,8 @@ recorded here rather than fixed silently.
 │   ├── test_import_report.py # The full import pipeline
 │   ├── test_import_errors.py # The error report, pagination
 │   ├── test_architecture.py # The layering rules, as assertions
-│   └── test_concurrency.py  # The duplicate race (xfail)
+│   ├── test_concurrency.py  # The duplicate race (xfail)
+│   └── test_transaction_boundaries.py # Atomicity, one bad invoice vs the rest
 ├── pytest.ini
 ├── .env.example             # Every setting, with dev defaults
 ├── requirements.txt         # Pinned dependencies
