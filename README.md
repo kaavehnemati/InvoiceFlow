@@ -2,12 +2,13 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 20 — import report. **Uploading a spreadsheet now creates
-invoices**, and `GET /imports/{id}` reports what happened. Behind it: parsing, grouping,
-structural checks, the published import contract, invoices with line items whose amounts are
-derived and reconciled, three layers wired by FastAPI, a validated settings object, domain
-exceptions translated to HTTP in one place, structured logging, and 170 tests. Per-row error
-reporting is addressed by a later
+**Current status:** Phase 21 — import error report. **`GET /imports/{id}/errors` turns the
+counts into actionable detail** — which row, which invoice, which field, in plain language a
+business user can act on. Behind it: uploading a spreadsheet creates invoices, parsing,
+grouping, structural checks, the published import contract, invoices with line items whose
+amounts are derived and reconciled, three layers wired by FastAPI, a validated settings
+object, domain exceptions translated to HTTP in one place, structured logging, and 180 tests.
+Explicit transaction boundaries are addressed by a later
 phase of [the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md),
 and only once the previous phase makes the need for it obvious.
 
@@ -329,7 +330,77 @@ nine. Phase 22 makes that boundary deliberate rather than a side effect of where
 happens to be.
 
 Errors are persisted as they are produced — the uploaded file is discarded, so an error not
-written down is gone. Phase 21 turns them into a readable report.
+written down is gone.
+
+### Reading what went wrong
+
+```bash
+curl "http://127.0.0.1:8000/imports/imp_628b4ef2fbbd/errors"
+```
+
+```json
+{
+  "total": 4, "limit": 100, "offset": 0,
+  "errors": [
+    {
+      "scope": "row", "row_number": 4, "invoice_number": "INV-BADROW",
+      "vendor": "Acme Ltd", "code": "INVALID_NUMBER", "field": "quantity",
+      "message": "'two' is not a number",
+      "summary": "Row 4 → 'two' is not a number"
+    },
+    {
+      "scope": "invoice", "row_number": null, "invoice_number": "INV-SPLIT",
+      "vendor": "Acme Ltd", "code": "INCONSISTENT_INVOICE_FIELD", "field": "currency",
+      "message": "rows of this invoice disagree about currency: row 5 says EUR; row 6 says USD",
+      "summary": "Invoice INV-SPLIT → rows of this invoice disagree about currency: row 5 says EUR; row 6 says USD"
+    }
+  ]
+}
+```
+
+Read as prose, one file with several kinds of problem in it:
+
+```text
+Row 4 → 'two' is not a number
+Invoice INV-SPLIT → rows of this invoice disagree about currency: row 5 says EUR; row 6 says USD
+Invoice INV-BADROW → row(s) 4 could not be read, so no invoice could be built from them
+Invoice INV-BADCURR → currency must be one of EUR, GBP, USD
+```
+
+That is what the counts on the report were standing in for. `invoices_failed: 3` says *how
+many*; this endpoint says *which ones, and why*, so someone can go back to the spreadsheet and
+actually fix it.
+
+**`scope` tells you which identifying field to trust.** A `"row"` error always carries a
+`row_number`; an `"invoice"` error never does, because there is no single row to point at —
+grouping or a business rule failed across the whole invoice. `invoice_number`/`vendor` may
+still be populated on a row error when the identity cells were themselves readable — Phase 19
+needs that to attribute a failed row to its invoice, so it is not a leak between the two
+scopes, it is the same information serving two purposes.
+
+**`code` and `field` for software, `summary` for people.** Every other error surface in this
+API returns `{code, field, message}` — nothing here abandons that. `summary` is rendered once
+at the response boundary from those same fields, so a UI can display it directly while
+anything automated still filters on `code`.
+
+**A structurally invalid invoice can produce two stored errors from one bad cell**, and that
+is correct rather than duplicated noise: `INV-BADROW`'s row 4 fails to parse (`INVALID_NUMBER`
+on `quantity`), and because that row can never become a line item, grouping separately reports
+the invoice as `INCOMPLETE_INVOICE`. Two different facts — the cell is unreadable, and the
+invoice is missing a line as a consequence.
+
+**Paginated**, because a 100,000-file historical import (Phase 40) could produce far more
+errors than fit in one response:
+
+```bash
+curl "http://127.0.0.1:8000/imports/imp_.../errors?limit=5&offset=10"
+```
+
+`total` always reflects the whole import, not just the page returned, so a client can tell
+"10 of 943" from "10 of 10" without a second request. Default `limit` is 100; `limit`/`offset`
+are validated by FastAPI itself (`limit` 1–1000, `offset` ≥ 0) — no custom bounds-checking
+needed. An import with zero errors returns `200` and an empty list, not `404`; `404` is
+reserved for an import id that does not exist at all.
 
 ## Row parsing
 
@@ -442,7 +513,7 @@ uv run pytest
 One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 
 ```text
-168 passed, 2 xfailed in 4.2s
+180 passed, 2 xfailed in 2.1s
 ```
 
 | File | Category | Tests |
@@ -458,6 +529,7 @@ One command. No server, no `PYTHONPATH`, no fixtures to set up by hand.
 | `test_parser.py` | row parsing and normalisation | 22 |
 | `test_grouper.py` | grouping and cross-row consistency | 23 |
 | `test_import_report.py` | the full import pipeline | 16 |
+| `test_import_errors.py` | the error report, pagination | 12 |
 | `test_concurrency.py` | the duplicate race (`xfail`) | 1 |
 
 ### Your development data is safe
@@ -885,15 +957,18 @@ recorded here rather than fixed silently.
 │   │   ├── base.py          # Base — the declarative registry
 │   │   └── session.py       # DATABASE_URL, engine, SessionLocal
 │   ├── models/
-│   │   └── invoice.py       # Invoice — the "invoices" table
+│   │   ├── invoice.py       # Invoice, InvoiceItem
+│   │   └── import_job.py    # ImportJob, ImportError
 │   ├── repositories/
-│   │   └── invoice_repository.py   # All invoice SQL lives here
+│   │   ├── invoice_repository.py       # All invoice SQL lives here
+│   │   └── import_job_repository.py    # All import-job SQL lives here
 │   ├── routers/
-│   │   ├── imports.py       # Upload endpoint
+│   │   ├── imports.py       # Upload, report, and error-report endpoints
 │   │   ├── invoices.py      # HTTP only: routes, status codes
 │   │   └── templates.py     # The import template download
 │   ├── schemas/
-│   │   └── invoice.py       # InvoiceCreate, InvoiceRead
+│   │   ├── invoice.py       # InvoiceCreate, InvoiceRead
+│   │   └── import_job.py    # ImportJobRead, ImportErrorRead, ImportErrorList
 │   └── services/
 │       ├── invoice_service.py      # Business rules and invoice creation
 │       ├── import_service.py       # Structural validation of uploads
@@ -916,6 +991,7 @@ recorded here rather than fixed silently.
 │   ├── test_parser.py       # Cells -> typed rows
 │   ├── test_grouper.py      # Rows -> invoices
 │   ├── test_import_report.py # The full import pipeline
+│   ├── test_import_errors.py # The error report, pagination
 │   ├── test_architecture.py # The layering rules, as assertions
 │   └── test_concurrency.py  # The duplicate race (xfail)
 ├── pytest.ini

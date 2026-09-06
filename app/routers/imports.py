@@ -1,8 +1,8 @@
-from fastapi import APIRouter, UploadFile
+from fastapi import APIRouter, Query, UploadFile
 
 from app.core.exceptions import ImportJobNotFoundError
 from app.dependencies import ImportJobRepositoryDep, ImportServiceDep
-from app.schemas.import_job import ImportJobRead
+from app.schemas.import_job import ImportErrorList, ImportJobRead
 
 router = APIRouter(prefix="/imports", tags=["imports"])
 
@@ -27,3 +27,22 @@ def get_import(import_id: str, repository: ImportJobRepositoryDep) -> ImportJobR
     if job is None:
         raise ImportJobNotFoundError(import_id)
     return job
+
+
+@router.get("/{import_id}/errors", response_model=ImportErrorList)
+def get_import_errors(
+    import_id: str,
+    repository: ImportJobRepositoryDep,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> ImportErrorList:
+    """Actionable detail behind the counts: what needs fixing, and where.
+
+    404 only when the import itself does not exist. An import with zero
+    errors is not an error condition -- it returns 200 with an empty list.
+    """
+    if repository.get_by_id(import_id) is None:
+        raise ImportJobNotFoundError(import_id)
+
+    errors, total = repository.list_errors(import_id, limit, offset)
+    return ImportErrorList(total=total, limit=limit, offset=offset, errors=errors)
