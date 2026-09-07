@@ -1,0 +1,14 @@
+services:
+  db:
+    restart: unless-stopped
+    # !override, not a plain list -- Compose merges list-valued keys like
+    # `ports` by appending, so a plain override would leave the base file's
+    # 0.0.0.0:5433 mapping in place *alongside* this one instead of replacing
+    # it, publicly exposing the database again. Verified directly: without
+    # `!override`, `docker compose config` shows both bindings.
+    ports: !override
+      - "127.0.0.1:5433:5432"
+  migrate:
+    restart: "no"
+  app:
+    restart: unless-stopped
