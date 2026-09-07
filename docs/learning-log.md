@@ -3088,3 +3088,135 @@ a fact buried inside a process whose job description is "serve HTTP requests."
 5. Why did this phase's `pytest` requirement reduce to "the existing suite must not change,"
    rather than "add new tests"?
 6. Two Postgres instances both claim port 5432. What actually breaks, and what doesn't?
+
+
+## Phase 24 — Deployment Exercise: Lightsail
+
+### What I learned
+
+**Deployment is where "it works on my machine" stops being a joke and starts being a
+measurement problem.** The application needed no changes at all — Phase 23's image ran
+unmodified on a machine in Frankfurt. Every difficulty in this phase was about the environment
+around it: which shell interpreted a script, which address the instance actually had, and
+whether the thing doing the measuring could measure anything at all.
+
+**A shebang is a request, not a guarantee.** The launch script began `#!/bin/bash` and used
+`set -euo pipefail`. Pasted into Lightsail's console field, the shebang did not survive as the
+literal first line, cloud-init fell back to `/bin/sh` (dash), and dash has no `pipefail` — so
+the script died on its first line of real work with `Illegal option -o pipefail`, before Docker
+was installed. The instance booted perfectly and served nothing.
+
+The fix was not to make the console behave. It was to notice that **nothing in the script
+needed bash**: there are no pipelines whose exit status matters, so `pipefail` was a habit
+rather than a requirement. `#!/bin/sh` with `set -eu` behaves identically in both shells.
+Depending on a feature you don't use is a cost with no benefit, and it only ever shows up
+somewhere inconvenient.
+
+**Attaching a static IP replaces the address; it does not add one.** Lightsail hands out a new
+address from the static pool and releases the dynamic one. Every test for the following hour
+was aimed at `18.153.59.47`, which by then routed nowhere. The symptom — timeouts from every
+node on earth — looked exactly like a broken firewall or a dead application, and was neither.
+
+**I trusted a measuring instrument I had never checked.** The reachability tests said the site
+was down. The pings said:
+
+```text
+ping 1.1.1.1       → 0.396 ms
+ping github.com    → 0.550 ms
+```
+
+Sub-millisecond round trips to Cloudflare and GitHub are not possible. The environment running
+those tests had no real internet egress: it completed TCP handshakes on every destination's
+behalf and forwarded nothing, which is precisely why `nc` reported "port open," `curl` connected
+and received zero bytes, and SSH failed "during banner exchange." Three independent-looking
+symptoms, one cause, and the cause was the instrument.
+
+The deployment was fine. Checked from ~25 third-party nodes against the correct address, every
+one returned `200 OK` in a few hundred milliseconds or less.
+
+**A negative test is worth more than a positive one, when it is the negative you claimed.**
+Port `8000` answering `200` from twenty-five countries proves the DoD. Port `5433` answering
+*nothing* from those same twenty-five countries, at the same moment, is what turns "the
+database isn't exposed" from a design intention into a fact. The second check took thirty
+seconds and is the only reason that sentence is in the documentation.
+
+**Compose merges lists by appending, which can silently invert a security control.** The
+override meant to restrict the database to `127.0.0.1:5433` did not replace the base file's
+`0.0.0.0:5433` mapping — it was *added alongside* it, leaving the database published to every
+interface while the override file read as though it did the opposite. `docker compose config`
+showed both bindings. The Compose spec's `!override` tag replaces rather than merges:
+
+```yaml
+ports: !override
+  - "127.0.0.1:5433:5432"
+```
+
+Caught before deployment only because the merged output was inspected rather than assumed.
+
+### Why this phase was needed
+
+Everything through Phase 23 ran on one laptop. "It runs in a container" is a claim about
+portability that is untested until the container runs on hardware nobody configured by hand.
+
+### What problem existed before it
+
+No evidence the application could run anywhere else, and no experience of the AWS model that
+later phases build on.
+
+### New concepts
+
+- Lightsail's resource model: blueprints, bundles, instances, static IPs, firewall rules
+- Cloud-init user-data as first-boot machine setup, and how it chooses an interpreter
+- Static IP allocation as *replacement* of a dynamic address
+- Compose override files for environment-specific differences, and `!override` for list-valued keys
+- Defense in depth: a cloud firewall and a loopback bind, either sufficient alone
+- Third-party reachability checking, and why a single vantage point cannot establish "publicly
+  reachable" in either direction
+
+### Things I still do not fully understand
+
+- The instance ran the stack as root via `sudo docker compose`. Real deployments add a non-root
+  user to the `docker` group — is that meaningfully safer, given that group membership is
+  effectively root anyway?
+- `restart: unless-stopped` brings containers back after a reboot, but nothing re-runs
+  `migrate` before `app` in that path — Compose's dependency conditions apply to
+  `up`, not to the restart policy. Does the app survive a reboot that lands mid-migration?
+- The launch script cloned a branch by name. A real deployment pins a tag or a digest — where
+  should that pin live so it is obvious what is deployed?
+
+### One architecture decision I can now explain
+
+**Why the same credentials that are fine locally were still not fine here, and why the exercise
+proceeded anyway.**
+
+`invoiceflow:invoiceflow` has been this project's database credential since Phase 7, documented
+everywhere as a development value and not a secret. On a laptop that is uncontroversial: the
+database listens on loopback, and the only reachable attacker is the person typing.
+
+Putting the same stack on a public IP changes the question, and the honest answer is that the
+credential did *not* become acceptable — the surrounding conditions made it survivable. Two of
+them, specifically: the database port was never reachable from outside the instance (verified
+from twenty-five vantage points, not assumed), and the instance existed for under two hours
+before being deleted. Take away either — leave it running, or open `5433` "just to check
+something" — and a well-known credential on a public host is a live incident rather than a
+footnote.
+
+The decision worth naming is therefore not "reuse the dev credentials." It is: **when you
+knowingly deploy something unsafe, write down what makes it survivable, and make each of those
+conditions checkable.** The `docs/deployment-lightsail.md` section on this says the credentials
+are wrong for real use, names the two conditions that made them tolerable here, and links the
+evidence for each. That is what separates an accepted risk from an unnoticed one — the accepted
+one has its assumptions written down where the next person can see which of them has since
+stopped being true.
+
+### Interview questions I should be able to answer
+
+1. A cloud-init launch script fails with `Illegal option -o pipefail`. What happened, and what
+   are two different ways to fix it?
+2. Why does attaching a static IP break every URL you wrote down five minutes earlier?
+3. You can't reach a server you just deployed. How do you tell a server problem from a network
+   problem from a broken test client?
+4. How do you prove a database is *not* publicly reachable, rather than asserting it?
+5. Why does `ports:` in a Compose override file need `!override`, and what happens without it?
+6. What has to be true before deploying something with known-weak credentials is a defensible
+   decision rather than a mistake?

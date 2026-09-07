@@ -2,15 +2,19 @@
 
 A backend platform for ingesting, validating, processing, and tracking invoices.
 
-**Current status:** Phase 23 — dockerized. **A new developer can run the whole application —
-FastAPI, PostgreSQL, and the schema migration that builds it — with `docker compose up` and
-nothing manually installed.** Behind it: a single invoice failing at the database level can no
-longer take the rest of an import down with it, a readable error report behind the counts,
-uploading a spreadsheet creates invoices, parsing, grouping, structural checks, the published
-import contract, invoices with line items whose amounts are derived and reconciled, three
-layers wired by FastAPI, a validated settings object, domain exceptions translated to HTTP in
-one place, structured logging, and 187 tests. Cloud deployment is addressed by a later phase of
-[the implementation playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md).
+**Current status:** Phase 24 — deployed, once, on purpose. **The application ran on an AWS
+Lightsail instance in Frankfurt and answered `200 OK` from ~25 countries; the instance was then
+deleted, and [the write-up](docs/deployment-lightsail.md) is what it left behind.** Behind it:
+`docker compose up` starts FastAPI, PostgreSQL, and the migration that builds the schema with
+nothing manually installed; a single invoice failing at the database level can no longer take
+the rest of an import down with it; a readable error report behind the counts; uploading a
+spreadsheet creates invoices; parsing, grouping, structural checks; the published import
+contract; invoices with line items whose amounts are derived and reconciled; three layers wired
+by FastAPI; a validated settings object; domain exceptions translated to HTTP in one place;
+structured logging; and 187 tests. A permanent, production-shaped deployment is addressed by
+later phases of [the implementation
+playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md) — Lightsail was explicitly a
+learning exercise, not the destination.
 
 ## Requirements
 
@@ -775,6 +779,21 @@ remove the volume explicitly:
 docker compose down -v   # this time, gone
 ```
 
+### Running it on a server
+
+`docker-compose.lightsail.yml` is a small override for running this same stack on a long-lived
+public machine rather than a laptop: restart policies so it survives a reboot, and the database
+port bound to `127.0.0.1` so it is not published to the world.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.lightsail.yml up -d
+```
+
+It is named for the exercise that produced it — [deploying to AWS
+Lightsail](docs/deployment-lightsail.md), which covers the machine setup, the ports, the
+database strategy, and the two false alarms that cost the most time along the way. That
+instance no longer exists; the document is the record.
+
 ## API
 
 | Method | Path | Purpose |
@@ -1109,6 +1128,9 @@ recorded here rather than fixed silently.
 ├── Dockerfile
 ├── .dockerignore
 ├── docker-compose.yml
+├── docker-compose.lightsail.yml  # Overrides for running on a public server
+├── deploy/
+│   └── lightsail-bootstrap.sh    # Cloud-init launch script for the VM
 ├── tests/
 │   ├── conftest.py          # Rolled-back session, client, factories
 │   ├── test_validation.py   # Unit — pure rules, no database
@@ -1129,7 +1151,8 @@ recorded here rather than fixed silently.
 ├── .env.example             # Every setting, with dev defaults
 ├── requirements.txt         # Pinned dependencies
 ├── docs/
-│   └── learning-log.md
+│   ├── learning-log.md
+│   └── deployment-lightsail.md   # The Lightsail exercise, and what it proved
 └── InvoiceFlow_Claude_Code_Implementation_Playbook.md
 ```
 
