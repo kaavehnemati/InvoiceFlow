@@ -1,0 +1,18 @@
+services:
+  db:
+    restart: unless-stopped
+    # !override, not a plain list -- see docker-compose.lightsail.yml for why:
+    # Compose appends list-valued keys like `ports` rather than replacing them.
+    ports: !override
+      - "127.0.0.1:5433:5432"
+  migrate:
+    restart: "no"
+  app:
+    restart: unless-stopped
+    # Nginx is the only public entrypoint on this instance. uvicorn has no
+    # business being reachable on any external interface, regardless of what
+    # the EC2 Security Group allows -- the same defense-in-depth reasoning
+    # applied to `db` here, applied to `app` for the first time because this
+    # is the first deployment with a reverse proxy in front of it.
+    ports: !override
+      - "127.0.0.1:8000:8000"

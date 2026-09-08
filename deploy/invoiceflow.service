@@ -1,0 +1,14 @@
+[Unit]
+Description=InvoiceFlow (docker compose)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/invoiceflow
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.ec2.yml up -d
+ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.ec2.yml down
+
+[Install]
+WantedBy=multi-user.target
