@@ -16,6 +16,10 @@ later phases of [the implementation
 playbook](InvoiceFlow_Claude_Code_Implementation_Playbook.md) — Lightsail was explicitly a
 learning exercise, not the destination.
 
+## Stack
+
+Python · FastAPI · PostgreSQL · SQLAlchemy · Alembic · Docker · pytest
+
 ## Requirements
 
 Either of two ways to run this, not both at once for the same purpose:
